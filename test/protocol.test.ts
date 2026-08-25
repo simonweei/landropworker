@@ -51,4 +51,9 @@ describe("binary file protocol", () => {
     expect(message).toContain("不要覆盖已有文件");
     expect(message).toContain("8.0 GB");
   });
+
+  it("explains exclusive file lock failures", () => {
+    const error = new DOMException("locked", "NoModificationAllowedError");
+    expect(describeFileSystemError(error, 1)).toContain("其他标签页或程序");
+  });
 });

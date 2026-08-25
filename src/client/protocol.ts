@@ -98,5 +98,11 @@ export function describeFileSystemError(error: unknown, fileSize: number): strin
   if (error instanceof DOMException && error.name === "NotAllowedError") {
     return "保存文件失败：浏览器没有目标文件的写入权限，请重新选择保存位置。";
   }
+  if (error instanceof DOMException && error.name === "NoModificationAllowedError") {
+    return "保存文件失败：目标文件正在被其他标签页或程序写入。请关闭占用它的程序，并换一个新文件名后重试。";
+  }
+  if (error instanceof DOMException && error.name === "AbortError") {
+    return "保存文件被浏览器安全检查中止。请换一个新文件名或保存目录后重试。";
+  }
   return error instanceof Error ? error.message : "文件保存失败";
 }

@@ -56,7 +56,10 @@ type PendingReceive = {
 
 type SavePickerWindow = Window & {
   showSaveFilePicker?: (options?: { suggestedName?: string }) => Promise<{
-    createWritable(): Promise<WritableTarget>;
+    createWritable(options?: {
+      keepExistingData?: boolean;
+      mode?: "exclusive" | "siloed";
+    }): Promise<WritableTarget>;
   }>;
 };
 
@@ -513,7 +516,17 @@ class LanDropApp {
       const picker = (window as SavePickerWindow).showSaveFilePicker;
       if (picker) {
         const handle = await picker({ suggestedName: suggestedReceivedName(receiver.meta.name) });
-        receiver.writer = await handle.createWritable();
+        try {
+          receiver.writer = await handle.createWritable({
+            keepExistingData: false,
+            mode: "exclusive",
+          });
+        } catch (error) {
+          // Older Chromium releases implemented createWritable() before the
+          // locking mode option. Keep compatibility while preferring a lock.
+          if (!(error instanceof TypeError)) throw error;
+          receiver.writer = await handle.createWritable({ keepExistingData: false });
+        }
       } else if (receiver.meta.size > FALLBACK_MEMORY_LIMIT) {
         throw new Error(`当前浏览器不能安全接收超过 ${formatBytes(FALLBACK_MEMORY_LIMIT)} 的文件`);
       }
