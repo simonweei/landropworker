@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#07111f" />
+    <title>LAN Drop · 局域网直传</title>
+  </head>
+  <body>
+    <main class="shell">
+      <header class="brand">
+        <div class="brand-mark" aria-hidden="true">↗</div>
+        <div><strong>LAN Drop</strong><span>浏览器 P2P 文件直传</span></div>
+      </header>
+
+      <section id="home" class="panel hero">
+        <div class="eyebrow"><span class="pulse"></span> 文件不经过服务器</div>
+        <h1>把大文件，<br /><em>直接</em>送到身边设备。</h1>
+        <p class="lede">无需安装，无需账号。Cloudflare 只负责配对，文件通过 WebRTC 加密直传。</p>
+        <button id="createButton" class="primary">创建连接 <span>→</span></button>
+        <div class="divider"><span>或使用 6 位配对码</span></div>
+        <form id="joinForm" class="join-form">
+          <label for="codeInput">配对码</label>
+          <div class="code-row">
+            <input id="codeInput" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="000000" required />
+            <button type="submit">连接设备</button>
+          </div>
+        </form>
+        <p id="homeError" class="error" role="alert"></p>
+      </section>
+
+      <section id="session" class="panel session hidden">
+        <div class="session-top">
+          <div>
+            <span class="label">当前配对码</span>
+            <button id="copyCode" class="code" title="复制配对码">------</button>
+            <span id="expiry" class="muted"></span>
+          </div>
+          <div class="connection-card">
+            <span id="statusDot" class="status-dot"></span>
+            <div><strong id="connectionStatus">等待连接</strong><span id="peerName">尚无对方设备</span></div>
+          </div>
+        </div>
+
+        <div id="capabilityWarning" class="notice hidden"></div>
+
+        <label id="dropZone" class="drop-zone disabled">
+          <input id="fileInput" type="file" disabled />
+          <span class="drop-icon">＋</span>
+          <strong>选择或拖入文件</strong>
+          <span>建立 P2P 直连后即可发送</span>
+        </label>
+
+        <article id="incomingCard" class="incoming hidden">
+          <span class="eyebrow">收到文件请求</span>
+          <h2 id="incomingName"></h2>
+          <p id="incomingSize" class="muted"></p>
+          <div class="actions">
+            <button id="acceptButton" class="primary">选择保存位置并接受</button>
+            <button id="rejectButton" class="ghost">拒绝</button>
+          </div>
+        </article>
+
+        <article id="transferCard" class="transfer hidden">
+          <div class="transfer-title"><strong id="transferName"></strong><span id="transferState">准备中</span></div>
+          <div class="progress-track"><div id="progressBar"></div></div>
+          <div class="metrics">
+            <span id="progressText">0 B / 0 B</span>
+            <span id="speedText">0 MB/s</span>
+            <span id="etaText">剩余 --</span>
+          </div>
+          <p id="hashState" class="hash-state">SHA-256：等待传输</p>
+        </article>
+
+        <p id="sessionError" class="error" role="alert"></p>
+      </section>
+
+      <footer><span>端到端加密</span><span>无云端存储</span><span>禁止 TURN 中继</span></footer>
+    </main>
+    <script type="module" src="/src/client/app.ts"></script>
+  </body>
+</html>

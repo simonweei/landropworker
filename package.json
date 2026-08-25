@@ -1,0 +1,25 @@
+{
+  "name": "lan-drop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite build && wrangler dev",
+    "dev:ui": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run build && npm run typecheck && npm run test && wrangler deploy --dry-run"
+  },
+  "dependencies": {
+    "hash-wasm": "latest"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "latest",
+    "@types/node": "latest",
+    "typescript": "latest",
+    "vite": "latest",
+    "vitest": "^4.1.0",
+    "wrangler": "latest"
+  }
+}
