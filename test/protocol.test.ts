@@ -40,9 +40,9 @@ describe("binary file protocol", () => {
     expect(formatBytes(10 * 1024 ** 3)).toBe("10.0 GB");
   });
 
-  it("suggests a non-conflicting received filename", () => {
-    expect(suggestedReceivedName("archive.iso")).toBe("LAN-Drop-archive.iso");
-    expect(suggestedReceivedName("LAN-Drop-archive.iso")).toBe("LAN-Drop-archive.iso");
+  it("preserves the original filename", () => {
+    expect(suggestedReceivedName("archive.iso")).toBe("archive.iso");
+    expect(suggestedReceivedName("中文文件名.zip")).toBe("中文文件名.zip");
   });
 
   it("turns Chromium file state failures into actionable guidance", () => {

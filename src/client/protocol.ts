@@ -85,7 +85,7 @@ export function formatEta(seconds: number): string {
 }
 
 export function suggestedReceivedName(name: string): string {
-  return name.startsWith("LAN-Drop-") ? name : `LAN-Drop-${name}`;
+  return name;
 }
 
 export function describeFileSystemError(error: unknown, fileSize: number): string {
