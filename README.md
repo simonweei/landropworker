@@ -12,6 +12,7 @@
 桌面 Chrome / Edge：
 - File System Access API 流式写盘
 - 面向 GB / 数十 GB / 100GB 级文件的恒定内存架构
+- 一次选择或拖入多个文件，按队列逐个确认、传输和校验
 - 实际最大文件能力仍以浏览器、磁盘空间和真实设备压力测试为准
 
 不支持 showSaveFilePicker() 的浏览器：
@@ -1663,7 +1664,7 @@ MVP 必须完成：
 5. WebSocket信令
 6. WebRTC连接
 7. RTCDataChannel
-8. 单文件发送
+8. 多文件顺序队列（单次只传一个）
 9. 分块发送
 10. bufferedAmount流量控制
 11. 接收方确认
@@ -1694,7 +1695,6 @@ MVP 暂时可以不实现：
 增加：
 
 ```text
-多文件队列
 文件夹
 二维码配对
 SHA-256

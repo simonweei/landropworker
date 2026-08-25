@@ -54,6 +54,15 @@ type PendingReceive = {
   senderHash: string | null;
 };
 
+type OutgoingStatus = "waiting" | "awaiting" | "sending" | "verifying" | "complete" | "failed";
+
+type OutgoingTask = {
+  fileId: string;
+  file: File;
+  status: OutgoingStatus;
+  error?: string;
+};
+
 type SavePickerWindow = Window & {
   showSaveFilePicker?: (options?: { suggestedName?: string }) => Promise<{
     createWritable(options?: {
@@ -143,8 +152,11 @@ class LanDropApp {
   private verificationRunning = false;
   private selectedFile: File | null = null;
   private outgoingFileId: string | null = null;
+  private outgoingTasks: OutgoingTask[] = [];
+  private activeOutgoingTask: OutgoingTask | null = null;
   private senderAckedOffset = 0;
   private receiver: PendingReceive | null = null;
+  private readonly ignoredIncomingFileIds = new Set<string>();
   private receiveChain: Promise<void> = Promise.resolve();
   private speedSample = { bytes: 0, time: performance.now(), smoothed: 0 };
   private expiryTimer: number | null = null;
@@ -165,6 +177,9 @@ class LanDropApp {
   private readonly incomingCard = element<HTMLElement>("incomingCard");
   private readonly incomingName = element<HTMLElement>("incomingName");
   private readonly incomingSize = element<HTMLElement>("incomingSize");
+  private readonly queueCard = element<HTMLElement>("queueCard");
+  private readonly queueSummary = element<HTMLElement>("queueSummary");
+  private readonly queueList = element<HTMLOListElement>("queueList");
   private readonly transferCard = element<HTMLElement>("transferCard");
   private readonly transferName = element<HTMLElement>("transferName");
   private readonly transferState = element<HTMLElement>("transferState");
@@ -182,8 +197,7 @@ class LanDropApp {
     });
     this.copyCode.addEventListener("click", () => void navigator.clipboard.writeText(this.roomCode));
     this.fileInput.addEventListener("change", () => {
-      const file = this.fileInput.files?.[0];
-      if (file) void this.offerFile(file);
+      this.enqueueFiles(Array.from(this.fileInput.files ?? []));
     });
     this.dropZone.addEventListener("dragover", (event) => {
       if (!this.verified) return;
@@ -194,8 +208,7 @@ class LanDropApp {
     this.dropZone.addEventListener("drop", (event) => {
       event.preventDefault();
       this.dropZone.classList.remove("dragging");
-      const file = event.dataTransfer?.files[0];
-      if (file && this.verified) void this.offerFile(file);
+      this.enqueueFiles(Array.from(event.dataTransfer?.files ?? []));
     });
     element<HTMLButtonElement>("acceptButton").addEventListener("click", () => void this.acceptIncoming());
     element<HTMLButtonElement>("rejectButton").addEventListener("click", () => this.rejectIncoming());
@@ -427,31 +440,51 @@ class LanDropApp {
     this.control.send(JSON.stringify(control));
   }
 
-  private async offerFile(file: File): Promise<void> {
-    if (!this.verified || !this.peer) return;
-    if (this.selectedFile || this.receiver) {
+  private enqueueFiles(files: File[]): void {
+    this.fileInput.value = "";
+    if (files.length === 0 || !this.verified || !this.peer) return;
+    if (this.receiver) {
       this.sessionError.textContent = "当前已有文件任务，请等待完成";
       return;
     }
+    this.sessionError.textContent = "";
+    this.outgoingTasks.push(...files.map((file) => ({
+      fileId: crypto.randomUUID(),
+      file,
+      status: "waiting" as const,
+    })));
+    this.renderQueue();
+    this.startNextOutgoing();
+  }
+
+  private startNextOutgoing(): void {
+    if (!this.verified || !this.peer || this.activeOutgoingTask || this.receiver) return;
+    const task = this.outgoingTasks.find((item) => item.status === "waiting");
+    if (!task) return;
     try {
-      const fileId = crypto.randomUUID();
+      this.sessionError.textContent = "";
       const chunkSize = chooseChunkPayloadSize(this.peer.sctp?.maxMessageSize);
-      this.selectedFile = file;
-      this.outgoingFileId = fileId;
+      this.activeOutgoingTask = task;
+      this.selectedFile = task.file;
+      this.outgoingFileId = task.fileId;
       this.senderAckedOffset = 0;
-      this.showTransfer(file.name, file.size, "等待对方接受");
+      task.status = "awaiting";
+      this.renderQueue();
+      this.showTransfer(task.file.name, task.file.size, "等待对方接受");
       this.sendControl({
         type: "file-meta",
-        fileId,
-        name: file.name,
-        size: file.size,
-        mimeType: file.type || "application/octet-stream",
-        lastModified: file.lastModified,
+        fileId: task.fileId,
+        name: task.file.name,
+        size: task.file.size,
+        mimeType: task.file.type || "application/octet-stream",
+        lastModified: task.file.lastModified,
         chunkSize,
         protocolVersion: PROTOCOL_VERSION,
       });
     } catch (error) {
-      this.fail(error instanceof Error ? error.message : "无法发送文件请求");
+      const text = error instanceof Error ? error.message : "无法发送文件请求";
+      this.fail(text);
+      this.finishActiveOutgoing("failed", text, false);
     }
   }
 
@@ -465,6 +498,7 @@ class LanDropApp {
         case "file-accept":
           if (control.fileId === this.outgoingFileId) {
             this.senderAckedOffset = control.committedOffset;
+            this.setActiveOutgoingStatus("sending");
             void this.sendFile(control.committedOffset);
           }
           break;
@@ -473,8 +507,9 @@ class LanDropApp {
           break;
         case "file-reject":
           if (control.fileId === this.outgoingFileId) {
-            this.fail(control.reason ?? "对方拒绝了文件");
-            this.resetOutgoing();
+            const reason = control.reason ?? "对方拒绝了文件";
+            this.fail(reason);
+            this.finishActiveOutgoing("failed", reason, false);
           }
           break;
         case "file-complete":
@@ -484,7 +519,7 @@ class LanDropApp {
           if (control.fileId === this.outgoingFileId) {
             this.hashState.textContent = control.ok ? `SHA-256：校验通过 · ${control.hash}` : "SHA-256：接收端校验失败";
             this.transferState.textContent = control.ok ? "传输完成" : "校验失败";
-            this.resetOutgoing();
+            this.finishActiveOutgoing(control.ok ? "complete" : "failed", control.ok ? undefined : "SHA-256 校验失败", false);
           }
           break;
         case "file-error":
@@ -549,9 +584,10 @@ class LanDropApp {
   }
 
   private async handleChunk(raw: ArrayBuffer): Promise<void> {
+    const frame = decodeChunk(raw);
+    if (this.ignoredIncomingFileIds.has(frame.fileId)) return;
     const receiver = this.receiver;
     if (!receiver || (!receiver.writer && receiver.meta.size > FALLBACK_MEMORY_LIMIT)) throw new Error("尚未准备好接收文件");
-    const frame = decodeChunk(raw);
     if (frame.fileId !== receiver.meta.fileId) throw new Error("文件 ID 不匹配");
     if (frame.offset !== receiver.committedOffset) throw new Error(`文件偏移不连续：期待 ${receiver.committedOffset}，收到 ${frame.offset}`);
     if (receiver.committedOffset + frame.payload.byteLength > receiver.meta.size) throw new Error("收到的数据超过文件大小");
@@ -617,13 +653,14 @@ class LanDropApp {
       const hash = hasher.digest("hex");
       this.hashState.textContent = `SHA-256：发送端 ${hash}`;
       this.transferState.textContent = "等待接收端校验";
+      this.setActiveOutgoingStatus("verifying");
       this.sendControl({ type: "file-complete", fileId, hash });
     } catch (error) {
       if (this.outgoingFileId !== fileId) return;
       const text = error instanceof Error ? error.message : "文件发送失败";
       this.fail(text);
       this.trySendControl({ type: "file-error", fileId, error: text });
-      this.resetOutgoing();
+      this.finishActiveOutgoing("failed", text, true);
     }
   }
 
@@ -680,6 +717,7 @@ class LanDropApp {
     const receiver = this.receiver;
     const text = describeFileSystemError(error, receiver?.meta.size ?? 0);
     if (receiver) {
+      this.ignoredIncomingFileIds.add(receiver.meta.fileId);
       await this.abortReceiver(receiver, text);
       this.trySendControl({ type: "file-error", fileId: receiver.meta.fileId, error: text });
       this.receiver = null;
@@ -690,17 +728,18 @@ class LanDropApp {
   }
 
   private async handlePeerFileError(fileId: string, reason: string): Promise<void> {
+    this.fail(reason);
     if (this.outgoingFileId === fileId) {
       this.transferState.textContent = "对方保存失败";
       this.hashState.textContent = "SHA-256：未完成接收端校验";
-      this.resetOutgoing();
+      this.finishActiveOutgoing("failed", reason, true);
     }
     if (this.receiver?.meta.fileId === fileId) {
+      this.ignoredIncomingFileIds.add(fileId);
       await this.abortReceiver(this.receiver, reason);
       this.receiver = null;
       this.transferState.textContent = "传输失败";
     }
-    this.fail(reason);
   }
 
   private showTransfer(name: string, size: number, state: string): void {
@@ -727,11 +766,63 @@ class LanDropApp {
     }
   }
 
+  private setActiveOutgoingStatus(status: OutgoingStatus, error?: string): void {
+    if (!this.activeOutgoingTask) return;
+    this.activeOutgoingTask.status = status;
+    this.activeOutgoingTask.error = error;
+    this.renderQueue();
+  }
+
+  private finishActiveOutgoing(status: "complete" | "failed", error: string | undefined, waitForDrain: boolean): void {
+    this.setActiveOutgoingStatus(status, error);
+    this.resetOutgoing();
+    if (waitForDrain) void this.startNextOutgoingAfterDrain();
+    else this.startNextOutgoing();
+  }
+
+  private async startNextOutgoingAfterDrain(): Promise<void> {
+    while (this.data?.readyState === "open" && this.data.bufferedAmount > 0) await delay(20);
+    this.startNextOutgoing();
+  }
+
+  private renderQueue(): void {
+    const statusLabels: Record<OutgoingStatus, string> = {
+      waiting: "等待",
+      awaiting: "等待接受",
+      sending: "发送中",
+      verifying: "校验中",
+      complete: "完成",
+      failed: "失败",
+    };
+    this.queueCard.classList.toggle("hidden", this.outgoingTasks.length === 0);
+    const completed = this.outgoingTasks.filter((task) => task.status === "complete").length;
+    const failed = this.outgoingTasks.filter((task) => task.status === "failed").length;
+    this.queueSummary.textContent = `共 ${this.outgoingTasks.length} 个 · 完成 ${completed}${failed ? ` · 失败 ${failed}` : ""}`;
+    this.queueList.replaceChildren(...this.outgoingTasks.map((task) => {
+      const item = document.createElement("li");
+      item.className = `queue-item queue-${task.status}`;
+      const details = document.createElement("div");
+      const name = document.createElement("strong");
+      name.textContent = task.file.name;
+      const size = document.createElement("span");
+      size.textContent = formatBytes(task.file.size);
+      details.appendChild(name);
+      details.appendChild(size);
+      const status = document.createElement("span");
+      status.className = "queue-status";
+      status.textContent = statusLabels[task.status];
+      if (task.error) status.title = task.error;
+      item.appendChild(details);
+      item.appendChild(status);
+      return item;
+    }));
+  }
+
   private resetOutgoing(): void {
     this.selectedFile = null;
     this.outgoingFileId = null;
+    this.activeOutgoingTask = null;
     this.senderAckedOffset = 0;
-    this.fileInput.value = "";
   }
 
   private fail(reason: string): void {

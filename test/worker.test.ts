@@ -12,6 +12,14 @@ function post(path: string, body: Record<string, unknown> = {}): Promise<Respons
 }
 
 describe("pairing API", () => {
+  it("serves a multi-file picker and a visible queue target", async () => {
+    const response = await exports.default.fetch(new Request(`${origin}/`));
+    const html = await response.text();
+    expect(response.status).toBe(200);
+    expect(html).toContain('id="fileInput" type="file" multiple');
+    expect(html).toContain('id="queueList"');
+  });
+
   it("creates a six-digit room and joins it once", async () => {
     const created = await post("/api/rooms", { deviceName: "Sender" });
     expect(created.status).toBe(201);
