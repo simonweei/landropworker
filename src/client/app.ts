@@ -9,8 +9,10 @@ import {
   chooseChunkPayloadSize,
   decodeChunk,
   encodeChunk,
+  describeFileSystemError,
   formatBytes,
   formatEta,
+  suggestedReceivedName,
 } from "./protocol";
 
 type Role = "host" | "guest";
@@ -306,7 +308,7 @@ class LanDropApp {
       channel.addEventListener("message", (event: MessageEvent<ArrayBuffer>) => {
         this.receiveChain = this.receiveChain
           .then(() => this.handleChunk(event.data))
-          .catch((error: unknown) => this.fail(error instanceof Error ? error.message : "接收文件失败"));
+          .catch((error: unknown) => this.handleLocalReceiveFailure(error));
       });
     } else {
       channel.close();
@@ -483,7 +485,7 @@ class LanDropApp {
           }
           break;
         case "file-error":
-          this.fail(control.error);
+          await this.handlePeerFileError(control.fileId, control.error);
           break;
       }
     } catch (error) {
@@ -510,7 +512,7 @@ class LanDropApp {
     try {
       const picker = (window as SavePickerWindow).showSaveFilePicker;
       if (picker) {
-        const handle = await picker({ suggestedName: receiver.meta.name });
+        const handle = await picker({ suggestedName: suggestedReceivedName(receiver.meta.name) });
         receiver.writer = await handle.createWritable();
       } else if (receiver.meta.size > FALLBACK_MEMORY_LIMIT) {
         throw new Error(`当前浏览器不能安全接收超过 ${formatBytes(FALLBACK_MEMORY_LIMIT)} 的文件`);
@@ -553,8 +555,9 @@ class LanDropApp {
     }
   }
 
-  private async waitForSendCapacity(nextOffset: number): Promise<void> {
+  private async waitForSendCapacity(nextOffset: number, fileId: string): Promise<void> {
     while (true) {
+      if (this.outgoingFileId !== fileId) throw new Error("文件任务已取消");
       if (this.data?.readyState !== "open") throw new Error("文件通道已断开");
       const networkReady = this.data.bufferedAmount < BUFFERED_AMOUNT_LIMIT;
       const diskReady = nextOffset - this.senderAckedOffset < MAX_UNACKNOWLEDGED_BYTES;
@@ -583,7 +586,7 @@ class LanDropApp {
 
       this.transferState.textContent = "正在发送";
       while (offset < file.size) {
-        await this.waitForSendCapacity(offset);
+        await this.waitForSendCapacity(offset, fileId);
         const end = Math.min(offset + chunkSize, file.size);
         const payload = await file.slice(offset, end).arrayBuffer();
         hasher.update(new Uint8Array(payload));
@@ -593,17 +596,21 @@ class LanDropApp {
       }
 
       while (this.senderAckedOffset < file.size) {
+        if (this.outgoingFileId !== fileId) throw new Error("文件任务已取消");
         if (this.data.readyState !== "open") throw new Error("文件通道已断开");
         await delay(12);
       }
+      if (this.outgoingFileId !== fileId) throw new Error("文件任务已取消");
       const hash = hasher.digest("hex");
       this.hashState.textContent = `SHA-256：发送端 ${hash}`;
       this.transferState.textContent = "等待接收端校验";
       this.sendControl({ type: "file-complete", fileId, hash });
     } catch (error) {
+      if (this.outgoingFileId !== fileId) return;
       const text = error instanceof Error ? error.message : "文件发送失败";
       this.fail(text);
-      this.sendControl({ type: "file-error", fileId, error: text });
+      this.trySendControl({ type: "file-error", fileId, error: text });
+      this.resetOutgoing();
     }
   }
 
@@ -611,22 +618,76 @@ class LanDropApp {
     const receiver = this.receiver;
     if (!receiver || receiver.meta.fileId !== fileId) throw new Error("完成消息对应未知文件");
     if (receiver.committedOffset !== receiver.meta.size) throw new Error("文件尚未完整写入");
-    receiver.senderHash = senderHash;
-    const localHash = receiver.hasher.digest("hex");
-    const ok = localHash === senderHash;
-    if (receiver.writer) await receiver.writer.close();
-    else {
-      const url = URL.createObjectURL(new Blob(receiver.chunks, { type: receiver.meta.mimeType }));
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = receiver.meta.name;
-      link.click();
-      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+    try {
+      receiver.senderHash = senderHash;
+      const localHash = receiver.hasher.digest("hex");
+      const ok = localHash === senderHash;
+      if (receiver.writer) await receiver.writer.close();
+      else {
+        const url = URL.createObjectURL(new Blob(receiver.chunks, { type: receiver.meta.mimeType }));
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = suggestedReceivedName(receiver.meta.name);
+        link.click();
+        window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      }
+      this.hashState.textContent = ok ? `SHA-256：校验通过 · ${localHash}` : `SHA-256：校验失败 · ${localHash}`;
+      this.transferState.textContent = ok ? "接收完成" : "校验失败";
+      this.sendControl({ type: "file-verified", fileId, ok, hash: localHash });
+      this.receiver = null;
+    } catch (error) {
+      const text = describeFileSystemError(error, receiver.meta.size);
+      await this.abortReceiver(receiver, text);
+      this.receiver = null;
+      this.transferState.textContent = "保存失败";
+      this.hashState.textContent = "SHA-256：文件未能提交到磁盘";
+      this.trySendControl({ type: "file-error", fileId, error: text });
+      throw new Error(text);
     }
-    this.hashState.textContent = ok ? `SHA-256：校验通过 · ${localHash}` : `SHA-256：校验失败 · ${localHash}`;
-    this.transferState.textContent = ok ? "接收完成" : "校验失败";
-    this.sendControl({ type: "file-verified", fileId, ok, hash: localHash });
-    this.receiver = null;
+  }
+
+  private trySendControl(control: ControlMessage): void {
+    try {
+      this.sendControl(control);
+    } catch {
+      // The local UI still needs to recover even if the peer disconnected.
+    }
+  }
+
+  private async abortReceiver(receiver: PendingReceive, reason: string): Promise<void> {
+    if (!receiver.writer) return;
+    try {
+      await receiver.writer.abort(reason);
+    } catch {
+      // A stream whose close already failed may no longer be abortable.
+    }
+  }
+
+  private async handleLocalReceiveFailure(error: unknown): Promise<void> {
+    const receiver = this.receiver;
+    const text = describeFileSystemError(error, receiver?.meta.size ?? 0);
+    if (receiver) {
+      await this.abortReceiver(receiver, text);
+      this.trySendControl({ type: "file-error", fileId: receiver.meta.fileId, error: text });
+      this.receiver = null;
+    }
+    this.transferState.textContent = "保存失败";
+    this.hashState.textContent = "SHA-256：文件未能提交到磁盘";
+    this.fail(text);
+  }
+
+  private async handlePeerFileError(fileId: string, reason: string): Promise<void> {
+    if (this.outgoingFileId === fileId) {
+      this.transferState.textContent = "对方保存失败";
+      this.hashState.textContent = "SHA-256：未完成接收端校验";
+      this.resetOutgoing();
+    }
+    if (this.receiver?.meta.fileId === fileId) {
+      await this.abortReceiver(this.receiver, reason);
+      this.receiver = null;
+      this.transferState.textContent = "传输失败";
+    }
+    this.fail(reason);
   }
 
   private showTransfer(name: string, size: number, state: string): void {

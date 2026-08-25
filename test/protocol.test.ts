@@ -4,8 +4,10 @@ import {
   MAX_DATA_MESSAGE_SIZE,
   chooseChunkPayloadSize,
   decodeChunk,
+  describeFileSystemError,
   encodeChunk,
   formatBytes,
+  suggestedReceivedName,
 } from "../src/client/protocol";
 
 describe("binary file protocol", () => {
@@ -36,5 +38,17 @@ describe("binary file protocol", () => {
   it("formats user-facing sizes", () => {
     expect(formatBytes(1024)).toBe("1.0 KB");
     expect(formatBytes(10 * 1024 ** 3)).toBe("10.0 GB");
+  });
+
+  it("suggests a non-conflicting received filename", () => {
+    expect(suggestedReceivedName("archive.iso")).toBe("LAN-Drop-archive.iso");
+    expect(suggestedReceivedName("LAN-Drop-archive.iso")).toBe("LAN-Drop-archive.iso");
+  });
+
+  it("turns Chromium file state failures into actionable guidance", () => {
+    const error = new DOMException("cached state changed", "InvalidStateError");
+    const message = describeFileSystemError(error, 8 * 1024 ** 3);
+    expect(message).toContain("不要覆盖已有文件");
+    expect(message).toContain("8.0 GB");
   });
 });

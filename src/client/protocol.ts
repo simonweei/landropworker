@@ -83,3 +83,20 @@ export function formatEta(seconds: number): string {
   const minutes = Math.floor(seconds / 60);
   return `${minutes} 分 ${Math.ceil(seconds % 60)} 秒`;
 }
+
+export function suggestedReceivedName(name: string): string {
+  return name.startsWith("LAN-Drop-") ? name : `LAN-Drop-${name}`;
+}
+
+export function describeFileSystemError(error: unknown, fileSize: number): string {
+  if (error instanceof DOMException && error.name === "InvalidStateError") {
+    return `保存文件失败：目标文件在传输期间发生变化，或磁盘空间不足。请不要覆盖已有文件，换一个新文件名，并确保至少有 ${formatBytes(fileSize)} 可用空间后重试。`;
+  }
+  if (error instanceof DOMException && error.name === "QuotaExceededError") {
+    return `保存文件失败：磁盘空间不足。请至少释放 ${formatBytes(fileSize)} 空间后重试。`;
+  }
+  if (error instanceof DOMException && error.name === "NotAllowedError") {
+    return "保存文件失败：浏览器没有目标文件的写入权限，请重新选择保存位置。";
+  }
+  return error instanceof Error ? error.message : "文件保存失败";
+}
