@@ -17,11 +17,14 @@
 - 实际最大文件能力仍以浏览器、磁盘空间和真实设备压力测试为准
 
 不支持 showSaveFilePicker() 的浏览器：
-- 只允许接收不超过 256MB 的内存降级文件
-- 超过限制时明确拒绝，不把大文件偷偷堆入内存
+- 支持 OPFS 时，文件会流式写入浏览器私有存储，完成后由用户保存或分享到设备
+- OPFS 不可用时，才降级为不超过 256MB 的内存接收
+- 移动端大文件上限取决于设备剩余空间和浏览器为当前站点提供的存储配额
 ```
 
-Safari/iOS 可以参与配对和 WebRTC，但本版不承诺超大文件流式落盘。所有能力均使用 feature detection，不使用 User-Agent 猜测。
+Safari/iOS 可以参与配对和 WebRTC；支持 OPFS 的版本会采用流式暂存，完成后再保存或分享到设备。可接收的实际大小仍受设备空间、站点存储配额和系统分享能力限制。所有能力均使用 feature detection，不使用 User-Agent 猜测。
+
+对于未公开 `transport.selectedCandidatePairId` 的移动浏览器，会兼容读取已成功且 nominated/selected 的 candidate pair；如果浏览器完全隐藏候选详情，则在确认两个 DataChannel 已打开后继续使用 P2P，因为项目没有配置 TURN 服务或凭据。
 
 ### 已修订的传输可靠性规则
 

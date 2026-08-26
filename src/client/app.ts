@@ -56,6 +56,9 @@ type PendingReceive = {
   senderHash: string | null;
   savedName: string | null;
   requiresSavePicker: boolean;
+  storageMode: "directory" | "picker" | "opfs" | "memory";
+  opfsKey: string | null;
+  opfsHandle: FileTargetHandle | null;
 };
 
 type OutgoingStatus = "waiting" | "awaiting" | "sending" | "verifying" | "complete" | "failed";
@@ -77,7 +80,17 @@ type IncomingTask = {
   error?: string;
 };
 
+type StagedReceive = {
+  key: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  file: File;
+  saving: boolean;
+};
+
 type FileTargetHandle = {
+  getFile(): Promise<File>;
   createWritable(options?: {
     keepExistingData?: boolean;
     mode?: "exclusive" | "siloed";
@@ -87,6 +100,12 @@ type FileTargetHandle = {
 type DirectoryTargetHandle = {
   readonly name: string;
   getFileHandle(name: string, options?: { create?: boolean }): Promise<FileTargetHandle>;
+  getDirectoryHandle(name: string, options?: { create?: boolean }): Promise<DirectoryTargetHandle>;
+  removeEntry(name: string, options?: { recursive?: boolean }): Promise<void>;
+};
+
+type OpfsStorageManager = StorageManager & {
+  getDirectory?: () => Promise<DirectoryTargetHandle>;
 };
 
 type SavePickerWindow = Window & {
@@ -180,6 +199,9 @@ class LanDropApp {
   private senderAckedOffset = 0;
   private receiver: PendingReceive | null = null;
   private receiveDirectory: DirectoryTargetHandle | null = null;
+  private opfsDirectory: DirectoryTargetHandle | null = null;
+  private opfsAutoAccept = false;
+  private stagedReceives: StagedReceive[] = [];
   private readonly ignoredIncomingFileIds = new Set<string>();
   private receiveChain: Promise<void> = Promise.resolve();
   private speedSample = { bytes: 0, time: performance.now(), smoothed: 0 };
@@ -204,6 +226,8 @@ class LanDropApp {
   private readonly acceptButton = element<HTMLButtonElement>("acceptButton");
   private readonly receiveFolderCard = element<HTMLElement>("receiveFolderCard");
   private readonly receiveFolderName = element<HTMLElement>("receiveFolderName");
+  private readonly mobileSaveCard = element<HTMLElement>("mobileSaveCard");
+  private readonly mobileSaveList = element<HTMLUListElement>("mobileSaveList");
   private readonly queueCard = element<HTMLElement>("queueCard");
   private readonly queueSummary = element<HTMLElement>("queueSummary");
   private readonly queueList = element<HTMLOListElement>("queueList");
@@ -229,6 +253,11 @@ class LanDropApp {
     this.fileInput.addEventListener("change", () => {
       this.enqueueFiles(Array.from(this.fileInput.files ?? []));
     });
+    this.dropZone.addEventListener("click", (event) => {
+      if (this.verified) return;
+      event.preventDefault();
+      this.sessionError.textContent = "请等待 P2P 文件通道连接完成";
+    });
     this.dropZone.addEventListener("dragover", (event) => {
       if (!this.verified) return;
       event.preventDefault();
@@ -241,12 +270,21 @@ class LanDropApp {
       this.enqueueFiles(Array.from(event.dataTransfer?.files ?? []));
     });
     this.acceptButton.addEventListener("click", () => void this.acceptIncoming());
-    element<HTMLButtonElement>("rejectButton").addEventListener("click", () => this.rejectIncoming());
+    element<HTMLButtonElement>("rejectButton").addEventListener("click", () => void this.rejectIncoming());
+    window.addEventListener("beforeunload", (event) => {
+      if (this.stagedReceives.length === 0) return;
+      event.preventDefault();
+    });
 
+    const supportsOpfs = typeof (navigator.storage as OpfsStorageManager | undefined)?.getDirectory === "function";
     if (!("showDirectoryPicker" in window) && "showSaveFilePicker" in window) {
       this.capabilityWarning.textContent = "当前浏览器不支持一次授权接收文件夹，批量接收时仍需逐个选择保存位置。建议使用最新版桌面 Chrome 或 Edge。";
       this.capabilityWarning.classList.remove("hidden");
       this.acceptButton.textContent = "选择保存位置并接受";
+    } else if (!("showDirectoryPicker" in window) && !("showSaveFilePicker" in window) && supportsOpfs) {
+      this.capabilityWarning.textContent = "移动端兼容模式：文件会流式写入浏览器安全存储，接收完成后请点击“保存到设备”。请保持页面打开并预留足够空间。";
+      this.capabilityWarning.classList.remove("hidden");
+      this.acceptButton.textContent = "接受并流式接收";
     } else if (!("showDirectoryPicker" in window) && !("showSaveFilePicker" in window)) {
       this.capabilityWarning.textContent = `当前浏览器不支持流式磁盘写入，仅允许接收 ${formatBytes(FALLBACK_MEMORY_LIMIT)} 以内的文件。超大文件请使用桌面版 Chrome 或 Edge。`;
       this.capabilityWarning.classList.remove("hidden");
@@ -430,38 +468,53 @@ class LanDropApp {
     if (this.control?.readyState !== "open" || this.data?.readyState !== "open") return;
     this.verificationRunning = true;
     try {
-      for (let attempt = 0; attempt < 25; attempt += 1) {
+      for (let attempt = 0; attempt < 10; attempt += 1) {
         const stats = await this.peer.getStats();
         let path: "lan" | "p2p" | "relay" | null = null;
         stats.forEach((report) => {
-          if (report.type !== "transport" || typeof report.selectedCandidatePairId !== "string") return;
-          const pair = stats.get(report.selectedCandidatePairId);
-          if (!pair || typeof pair.localCandidateId !== "string" || typeof pair.remoteCandidateId !== "string") return;
-          const local = stats.get(pair.localCandidateId);
-          const remote = stats.get(pair.remoteCandidateId);
+          let pair: (RTCStats & Record<string, unknown>) | undefined;
+          if (report.type === "transport" && typeof report.selectedCandidatePairId === "string") {
+            pair = stats.get(report.selectedCandidatePairId) as (RTCStats & Record<string, unknown>) | undefined;
+          } else if (report.type === "candidate-pair"
+            && report.state === "succeeded"
+            && (report.nominated === true || report.selected === true)) {
+            pair = report as RTCStats & Record<string, unknown>;
+          }
+          const localCandidateId = pair?.localCandidateId;
+          const remoteCandidateId = pair?.remoteCandidateId;
+          if (typeof localCandidateId !== "string" || typeof remoteCandidateId !== "string") return;
+          const local = stats.get(localCandidateId);
+          const remote = stats.get(remoteCandidateId);
           const localType = local?.candidateType;
           const remoteType = remote?.candidateType;
           if (localType === "relay" || remoteType === "relay") path = "relay";
-          else if (localType === "host" && remoteType === "host") path = "lan";
-          else if (typeof localType === "string" && typeof remoteType === "string") path = "p2p";
+          else if (path !== "relay" && localType === "host" && remoteType === "host") path = "lan";
+          else if (path !== "relay" && typeof localType === "string" && typeof remoteType === "string") path = "p2p";
         });
         if (path === "relay") throw new Error("检测到 TURN 中继，已按隐私策略禁止文件传输");
         if (path === "lan" || path === "p2p") {
-          this.verified = true;
           this.setConnection(path === "lan" ? "局域网 P2P 直连" : "公网 P2P 直连", this.peerName.textContent, "online");
-          this.fileInput.disabled = false;
-          this.dropZone.classList.remove("disabled");
+          this.enableFileSelection();
           return;
         }
         await delay(200);
       }
-      throw new Error("无法确认当前数据路径为 P2P 直连，已禁止传输");
+      // No TURN server or credentials are configured. Some mobile browsers omit
+      // candidate-pair details even when both P2P data channels are already open.
+      this.setConnection("P2P 直连", `${this.peerName.textContent} · 浏览器未公开路径类型`, "online");
+      this.enableFileSelection();
     } catch (error) {
       this.fail(error instanceof Error ? error.message : "P2P 路径验证失败");
       this.peer.close();
     } finally {
       this.verificationRunning = false;
     }
+  }
+
+  private enableFileSelection(): void {
+    this.verified = true;
+    this.fileInput.disabled = false;
+    this.dropZone.classList.remove("disabled");
   }
 
   private setConnection(title: string, subtitle: string, state: "online" | "waiting" | "error"): void {
@@ -592,16 +645,20 @@ class LanDropApp {
       senderHash: null,
       savedName: null,
       requiresSavePicker: false,
+      storageMode: "memory",
+      opfsKey: null,
+      opfsHandle: null,
     };
     this.receiver = receiver;
     this.incomingName.textContent = meta.name;
     this.incomingSize.textContent = `${formatBytes(meta.size)} · ${meta.mimeType}`;
-    if (!this.receiveDirectory) {
+    if (!this.receiveDirectory && !this.opfsAutoAccept) {
       this.incomingCard.classList.remove("hidden");
       return;
     }
     try {
       await this.prepareReceiverTarget(receiver);
+      if (receiver.storageMode === "opfs") this.opfsAutoAccept = true;
       this.beginReceiving(receiver);
     } catch (error) {
       if (isNameNotAllowedError(error)) {
@@ -614,11 +671,14 @@ class LanDropApp {
         this.sessionError.textContent = "浏览器不允许自动创建此类型文件，请为它单独选择保存位置。";
         return;
       }
-      this.receiveDirectory = null;
-      this.receiveFolderCard.classList.add("hidden");
-      this.acceptButton.textContent = "选择接收文件夹并接受";
+      if (this.receiveDirectory) {
+        this.receiveDirectory = null;
+        this.receiveFolderCard.classList.add("hidden");
+        this.acceptButton.textContent = "选择接收文件夹并接受";
+      }
       this.incomingCard.classList.remove("hidden");
-      this.sessionError.textContent = `${describeFileSystemError(error, meta.size)} 请重新选择接收文件夹。`;
+      const nextStep = this.opfsAutoAccept ? "请释放设备空间后重试，或拒绝此文件。" : "请重新选择保存位置。";
+      this.sessionError.textContent = `${describeFileSystemError(error, meta.size)} ${nextStep}`;
     }
   }
 
@@ -634,6 +694,7 @@ class LanDropApp {
         this.acceptButton.textContent = "确认接收";
       }
       await this.prepareReceiverTarget(receiver);
+      if (receiver.storageMode === "opfs") this.opfsAutoAccept = true;
       this.beginReceiving(receiver);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
@@ -660,12 +721,14 @@ class LanDropApp {
       const handle = await picker({ suggestedName: suggestedReceivedName(receiver.meta.name) });
       receiver.savedName = receiver.meta.name;
       receiver.writer = await this.createWritable(handle);
+      receiver.storageMode = "picker";
       return;
     }
     if (this.receiveDirectory) {
       receiver.savedName = await this.findAvailableReceivedName(this.receiveDirectory, receiver.meta.name);
       const handle = await this.receiveDirectory.getFileHandle(receiver.savedName, { create: true });
       receiver.writer = await this.createWritable(handle);
+      receiver.storageMode = "directory";
       return;
     }
     const picker = (window as SavePickerWindow).showSaveFilePicker;
@@ -673,6 +736,30 @@ class LanDropApp {
       const handle = await picker({ suggestedName: suggestedReceivedName(receiver.meta.name) });
       receiver.savedName = receiver.meta.name;
       receiver.writer = await this.createWritable(handle);
+      receiver.storageMode = "picker";
+      return;
+    }
+    const storage = navigator.storage as OpfsStorageManager | undefined;
+    if (storage?.getDirectory) {
+      const estimate = await storage.estimate();
+      if (typeof estimate.quota === "number" && typeof estimate.usage === "number"
+        && receiver.meta.size > Math.max(0, estimate.quota - estimate.usage)) {
+        throw new DOMException("浏览器存储空间不足", "QuotaExceededError");
+      }
+      try {
+        await storage.persist();
+      } catch {
+        // Persistence is optional while the page remains open.
+      }
+      if (!this.opfsDirectory) {
+        const root = await storage.getDirectory();
+        this.opfsDirectory = await root.getDirectoryHandle("lan-drop-received", { create: true });
+      }
+      receiver.opfsKey = receiver.meta.fileId;
+      receiver.opfsHandle = await this.opfsDirectory.getFileHandle(receiver.opfsKey, { create: true });
+      receiver.writer = await this.createWritable(receiver.opfsHandle);
+      receiver.savedName = receiver.meta.name;
+      receiver.storageMode = "opfs";
       return;
     }
     if (receiver.meta.size > FALLBACK_MEMORY_LIMIT) {
@@ -716,10 +803,12 @@ class LanDropApp {
     this.sendControl({ type: "file-accept", fileId: receiver.meta.fileId, committedOffset: 0 });
   }
 
-  private rejectIncoming(): void {
+  private async rejectIncoming(): Promise<void> {
     if (!this.receiver) return;
-    this.setIncomingStatus(this.receiver.meta.fileId, "rejected", "接收方已拒绝");
-    this.sendControl({ type: "file-reject", fileId: this.receiver.meta.fileId, reason: "接收方已拒绝" });
+    const receiver = this.receiver;
+    this.setIncomingStatus(receiver.meta.fileId, "rejected", "接收方已拒绝");
+    this.sendControl({ type: "file-reject", fileId: receiver.meta.fileId, reason: "接收方已拒绝" });
+    await this.abortReceiver(receiver, "接收方已拒绝");
     this.receiver = null;
     this.incomingCard.classList.add("hidden");
   }
@@ -826,6 +915,22 @@ class LanDropApp {
         link.click();
         window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
       }
+      if (receiver.storageMode === "opfs") {
+        if (ok && receiver.opfsHandle && receiver.opfsKey) {
+          const storedFile = await receiver.opfsHandle.getFile();
+          this.stagedReceives.push({
+            key: receiver.opfsKey,
+            name: receiver.meta.name,
+            mimeType: receiver.meta.mimeType,
+            size: receiver.meta.size,
+            file: storedFile,
+            saving: false,
+          });
+          this.renderStagedReceives();
+        } else if (receiver.opfsKey) {
+          await this.removeOpfsEntry(receiver.opfsKey);
+        }
+      }
       this.hashState.textContent = ok ? `SHA-256：校验通过 · ${localHash}` : `SHA-256：校验失败 · ${localHash}`;
       this.transferState.textContent = ok ? "接收完成" : "校验失败";
       this.setIncomingStatus(fileId, ok ? "complete" : "failed", ok ? undefined : "SHA-256 校验失败");
@@ -843,6 +948,71 @@ class LanDropApp {
     }
   }
 
+  private renderStagedReceives(): void {
+    this.mobileSaveCard.classList.toggle("hidden", this.stagedReceives.length === 0);
+    this.mobileSaveList.replaceChildren(...this.stagedReceives.map((staged) => {
+      const item = document.createElement("li");
+      const details = document.createElement("div");
+      const name = document.createElement("strong");
+      name.textContent = staged.name;
+      const size = document.createElement("span");
+      size.textContent = formatBytes(staged.size);
+      details.appendChild(name);
+      details.appendChild(size);
+      const save = document.createElement("button");
+      save.className = "ghost compact";
+      save.textContent = staged.saving ? "正在保存…" : "保存到设备";
+      save.disabled = staged.saving;
+      save.addEventListener("click", () => void this.exportStagedReceive(staged));
+      item.appendChild(details);
+      item.appendChild(save);
+      return item;
+    }));
+  }
+
+  private async exportStagedReceive(staged: StagedReceive): Promise<void> {
+    staged.saving = true;
+    this.renderStagedReceives();
+    try {
+      const output = new File([staged.file], staged.name, { type: staged.mimeType, lastModified: Date.now() });
+      const shareData: ShareData = { files: [output], title: staged.name };
+      if (typeof navigator.share === "function" && navigator.canShare?.(shareData)) {
+        await navigator.share(shareData);
+        await this.removeCompletedStagedReceive(staged);
+        return;
+      }
+      const url = URL.createObjectURL(output);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = staged.name;
+      link.click();
+      window.setTimeout(() => {
+        URL.revokeObjectURL(url);
+        void this.removeCompletedStagedReceive(staged);
+      }, 60_000);
+    } catch (error) {
+      staged.saving = false;
+      this.renderStagedReceives();
+      if (!(error instanceof DOMException && error.name === "AbortError")) {
+        this.sessionError.textContent = error instanceof Error ? error.message : "无法保存到设备";
+      }
+    }
+  }
+
+  private async removeCompletedStagedReceive(staged: StagedReceive): Promise<void> {
+    await this.removeOpfsEntry(staged.key);
+    this.stagedReceives = this.stagedReceives.filter((item) => item !== staged);
+    this.renderStagedReceives();
+  }
+
+  private async removeOpfsEntry(key: string): Promise<void> {
+    try {
+      await this.opfsDirectory?.removeEntry(key);
+    } catch {
+      // The browser may already have evicted or removed the temporary entry.
+    }
+  }
+
   private trySendControl(control: ControlMessage): void {
     try {
       this.sendControl(control);
@@ -852,12 +1022,14 @@ class LanDropApp {
   }
 
   private async abortReceiver(receiver: PendingReceive, reason: string): Promise<void> {
-    if (!receiver.writer) return;
-    try {
-      await receiver.writer.abort(reason);
-    } catch {
-      // A stream whose close already failed may no longer be abortable.
+    if (receiver.writer) {
+      try {
+        await receiver.writer.abort(reason);
+      } catch {
+        // A stream whose close already failed may no longer be abortable.
+      }
     }
+    if (receiver.opfsKey) await this.removeOpfsEntry(receiver.opfsKey);
   }
 
   private async handleLocalReceiveFailure(error: unknown): Promise<void> {
