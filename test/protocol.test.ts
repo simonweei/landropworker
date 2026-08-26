@@ -7,6 +7,7 @@ import {
   describeFileSystemError,
   encodeChunk,
   formatBytes,
+  isNameNotAllowedError,
   receivedNameCandidate,
   suggestedReceivedName,
 } from "../src/client/protocol";
@@ -50,6 +51,11 @@ describe("binary file protocol", () => {
     expect(receivedNameCandidate("archive.tar.gz", 1)).toBe("archive.tar (1).gz");
     expect(receivedNameCandidate("README", 2)).toBe("README (2)");
     expect(receivedNameCandidate("../unsafe.txt")).toBe(".._unsafe.txt");
+  });
+
+  it("recognizes Chromium's rejected-name error", () => {
+    expect(isNameNotAllowedError(new TypeError("Name is not allowed."))).toBe(true);
+    expect(isNameNotAllowedError(new DOMException("denied", "NotAllowedError"))).toBe(false);
   });
 
   it("turns Chromium file state failures into actionable guidance", () => {

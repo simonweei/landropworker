@@ -12,6 +12,7 @@ import {
   describeFileSystemError,
   formatBytes,
   formatEta,
+  isNameNotAllowedError,
   receivedNameCandidate,
   suggestedReceivedName,
 } from "./protocol";
@@ -569,8 +570,18 @@ class LanDropApp {
       await this.prepareReceiverTarget(receiver);
       this.beginReceiving(receiver);
     } catch (error) {
+      if (isNameNotAllowedError(error)) {
+        // Chromium requires a fresh user gesture before creating some
+        // security-sensitive file types through a reused directory handle.
+        // Keep the granted directory and let the user retry from the button.
+        this.incomingCard.classList.remove("hidden");
+        this.acceptButton.textContent = "确认接收";
+        this.sessionError.textContent = "浏览器要求再次确认创建此类型文件，请点击“确认接收”。";
+        return;
+      }
       this.receiveDirectory = null;
       this.receiveFolderCard.classList.add("hidden");
+      this.acceptButton.textContent = "选择接收文件夹并接受";
       this.incomingCard.classList.remove("hidden");
       this.sessionError.textContent = `${describeFileSystemError(error, meta.size)} 请重新选择接收文件夹。`;
     }
@@ -585,6 +596,7 @@ class LanDropApp {
         this.receiveDirectory = await directoryPicker({ mode: "readwrite" });
         this.receiveFolderName.textContent = this.receiveDirectory.name;
         this.receiveFolderCard.classList.remove("hidden");
+        this.acceptButton.textContent = "确认接收";
       }
       await this.prepareReceiverTarget(receiver);
       this.beginReceiving(receiver);
@@ -593,6 +605,13 @@ class LanDropApp {
       if (error instanceof DOMException && (error.name === "NotAllowedError" || error.name === "SecurityError")) {
         this.receiveDirectory = null;
         this.receiveFolderCard.classList.add("hidden");
+        this.acceptButton.textContent = "选择接收文件夹并接受";
+      } else if (isNameNotAllowedError(error) && this.receiveDirectory) {
+        this.sessionError.textContent = "浏览器仍拒绝创建该文件。请重新选择一个普通接收文件夹后再试。";
+        this.receiveDirectory = null;
+        this.receiveFolderCard.classList.add("hidden");
+        this.acceptButton.textContent = "重新选择文件夹并接受";
+        return;
       }
       this.sessionError.textContent = describeFileSystemError(error, receiver.meta.size);
     }

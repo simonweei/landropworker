@@ -96,6 +96,10 @@ export function receivedNameCandidate(name: string, duplicateIndex = 0): string 
   return `${safeName.slice(0, extensionAt)} (${duplicateIndex})${safeName.slice(extensionAt)}`;
 }
 
+export function isNameNotAllowedError(error: unknown): error is TypeError {
+  return error instanceof TypeError && /name is not allowed/i.test(error.message);
+}
+
 export function describeFileSystemError(error: unknown, fileSize: number): string {
   if (error instanceof DOMException && error.name === "InvalidStateError") {
     return `保存文件失败：目标文件在传输期间发生变化，或磁盘空间不足。请不要覆盖已有文件，换一个新文件名，并确保至少有 ${formatBytes(fileSize)} 可用空间后重试。`;
