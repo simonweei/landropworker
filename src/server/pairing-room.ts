@@ -3,6 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 const MAX_SIGNAL_BYTES = 64 * 1024;
 const CLOSE_EXPIRED = 4001;
 const CLOSE_REPLACED = 4002;
+const SESSION_RECONNECT_TTL_MS = 24 * 60 * 60 * 1000;
 const ALLOWED_SIGNALS = new Set(["offer", "answer", "ice-candidate", "renegotiate"]);
 
 type PeerRole = "host" | "guest";
@@ -19,6 +20,7 @@ type RoomRow = {
   host_name: string;
   guest_name: string | null;
   expires_at: number;
+  reconnect_until: number | null;
 };
 
 export type JoinResult =
@@ -60,15 +62,20 @@ export class PairingRoom extends DurableObject<Env> {
           guest_token TEXT,
           host_name TEXT NOT NULL,
           guest_name TEXT,
-          expires_at INTEGER NOT NULL
+          expires_at INTEGER NOT NULL,
+          reconnect_until INTEGER
         );
       `);
+      const columns = this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(room)").toArray();
+      if (!columns.some((column) => column.name === "reconnect_until")) {
+        this.ctx.storage.sql.exec("ALTER TABLE room ADD COLUMN reconnect_until INTEGER");
+      }
     });
   }
 
   private getRoom(): RoomRow | null {
     return this.ctx.storage.sql.exec<RoomRow>(
-      "SELECT code, host_token, guest_token, host_name, guest_name, expires_at FROM room WHERE id = 1",
+      "SELECT code, host_token, guest_token, host_name, guest_name, expires_at, reconnect_until FROM room WHERE id = 1",
     ).toArray()[0] ?? null;
   }
 
@@ -78,16 +85,17 @@ export class PairingRoom extends DurableObject<Env> {
 
   async createRoom(code: string, deviceName: string, expiresAt: number): Promise<{ token: string; expiresAt: number } | null> {
     const existing = this.getRoom();
-    if (existing && existing.expires_at > Date.now()) return null;
+    if (existing && (existing.reconnect_until ?? existing.expires_at) > Date.now()) return null;
     if (existing) this.closeAll(CLOSE_EXPIRED, "房间已过期");
 
     const token = crypto.randomUUID();
     this.ctx.storage.sql.exec("DELETE FROM room");
     this.ctx.storage.sql.exec(
-      "INSERT INTO room (id, code, host_token, host_name, expires_at) VALUES (1, ?, ?, ?, ?)",
+      "INSERT INTO room (id, code, host_token, host_name, expires_at, reconnect_until) VALUES (1, ?, ?, ?, ?, ?)",
       code,
       token,
       deviceName,
+      expiresAt,
       expiresAt,
     );
     await this.ctx.storage.setAlarm(expiresAt);
@@ -104,17 +112,21 @@ export class PairingRoom extends DurableObject<Env> {
     }
 
     const token = crypto.randomUUID();
+    const reconnectUntil = Date.now() + SESSION_RECONNECT_TTL_MS;
     this.ctx.storage.sql.exec(
-      "UPDATE room SET guest_token = ?, guest_name = ? WHERE id = 1",
+      "UPDATE room SET guest_token = ?, guest_name = ?, reconnect_until = ? WHERE id = 1",
       token,
       deviceName,
+      reconnectUntil,
     );
+    await this.ctx.storage.setAlarm(reconnectUntil);
     return { ok: true, token, expiresAt: room.expires_at };
   }
 
   override async fetch(request: Request): Promise<Response> {
     const room = this.getRoom();
-    if (!room || room.expires_at <= Date.now()) return new Response("房间不存在或已过期", { status: 404 });
+    const deadline = room?.guest_token ? room.reconnect_until ?? room.expires_at : room?.expires_at;
+    if (!room || !deadline || deadline <= Date.now()) return new Response("房间不存在或已过期", { status: 404 });
 
     const url = new URL(request.url);
     const token = url.searchParams.get("token");
@@ -186,6 +198,12 @@ export class PairingRoom extends DurableObject<Env> {
   }
 
   override async alarm(): Promise<void> {
+    const room = this.getRoom();
+    const deadline = room?.reconnect_until ?? room?.expires_at ?? 0;
+    if (deadline > Date.now()) {
+      await this.ctx.storage.setAlarm(deadline);
+      return;
+    }
     this.closeAll(CLOSE_EXPIRED, "配对码已过期");
     this.ctx.storage.sql.exec("DELETE FROM room");
   }

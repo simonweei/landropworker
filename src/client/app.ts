@@ -59,9 +59,10 @@ type PendingReceive = {
   storageMode: "directory" | "picker" | "opfs" | "memory";
   opfsKey: string | null;
   opfsHandle: FileTargetHandle | null;
+  accepted: boolean;
 };
 
-type OutgoingStatus = "waiting" | "awaiting" | "sending" | "verifying" | "complete" | "failed";
+type OutgoingStatus = "waiting" | "awaiting" | "sending" | "paused" | "verifying" | "complete" | "failed";
 
 type OutgoingTask = {
   fileId: string;
@@ -70,7 +71,7 @@ type OutgoingTask = {
   error?: string;
 };
 
-type IncomingStatus = "awaiting" | "receiving" | "verifying" | "complete" | "rejected" | "failed";
+type IncomingStatus = "awaiting" | "receiving" | "paused" | "verifying" | "complete" | "rejected" | "failed";
 
 type IncomingTask = {
   fileId: string;
@@ -194,6 +195,10 @@ class LanDropApp {
   private negotiationStarted = false;
   private verified = false;
   private verificationRunning = false;
+  private reconnecting = false;
+  private reconnectAttempts = 0;
+  private reconnectTimer: number | null = null;
+  private sendAttempt = 0;
   private selectedFile: File | null = null;
   private outgoingFileId: string | null = null;
   private outgoingTasks: OutgoingTask[] = [];
@@ -205,6 +210,7 @@ class LanDropApp {
   private opfsDirectory: DirectoryTargetHandle | null = null;
   private opfsAutoAccept = false;
   private stagedReceives: StagedReceive[] = [];
+  private readonly verifiedIncoming = new Map<string, string>();
   private readonly ignoredIncomingFileIds = new Set<string>();
   private receiveChain: Promise<void> = Promise.resolve();
   private speedSample = { bytes: 0, time: performance.now(), smoothed: 0 };
@@ -277,6 +283,9 @@ class LanDropApp {
     window.addEventListener("beforeunload", (event) => {
       if (this.stagedReceives.length === 0) return;
       event.preventDefault();
+    });
+    window.addEventListener("online", () => {
+      if (this.reconnecting) this.scheduleSignalingReconnect(0);
     });
 
     const supportsOpfs = typeof (navigator.storage as OpfsStorageManager | undefined)?.getDirectory === "function";
@@ -357,12 +366,41 @@ class LanDropApp {
   }
 
   private connectSignaling(): void {
+    if (!this.role || !this.roomCode || !this.token) return;
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    this.socket = new WebSocket(`${protocol}//${location.host}/ws/${this.roomCode}?token=${encodeURIComponent(this.token)}`);
-    this.socket.addEventListener("message", (event: MessageEvent<string>) => void this.handleSignal(event.data));
-    this.socket.addEventListener("close", () => {
-      if (!this.verified) this.setConnection("信令已断开", "请重新创建连接", "error");
+    const socket = new WebSocket(`${protocol}//${location.host}/ws/${this.roomCode}?token=${encodeURIComponent(this.token)}`);
+    this.socket = socket;
+    socket.addEventListener("open", () => {
+      if (this.socket === socket) this.reconnectAttempts = 0;
     });
+    socket.addEventListener("message", (event: MessageEvent<string>) => {
+      if (this.socket === socket) void this.handleSignal(event.data);
+    });
+    socket.addEventListener("close", (event) => {
+      if (this.socket !== socket) return;
+      this.socket = null;
+      if (event.code === 4001) {
+        this.setConnection("会话已过期", "请重新创建连接", "error");
+        return;
+      }
+      this.beginRecovery("信令连接已断开", false);
+      this.scheduleSignalingReconnect();
+    });
+  }
+
+  private scheduleSignalingReconnect(delayOverride?: number): void {
+    if (!this.role || this.socket?.readyState === WebSocket.OPEN || this.socket?.readyState === WebSocket.CONNECTING) return;
+    if (this.reconnectTimer !== null) window.clearTimeout(this.reconnectTimer);
+    const delayMs = delayOverride ?? Math.min(10_000, 750 * 2 ** this.reconnectAttempts);
+    this.reconnectAttempts += 1;
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connectSignaling();
+    }, delayMs);
   }
 
   private sendSignal(type: string, payload: unknown): void {
@@ -371,21 +409,57 @@ class LanDropApp {
   }
 
   private createPeer(): void {
-    this.peer = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.cloudflare.com:3478" }] });
-    this.peer.addEventListener("icecandidate", (event) => {
-      if (event.candidate) this.sendSignal("ice-candidate", event.candidate.toJSON());
+    const peer = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.cloudflare.com:3478" }] });
+    this.peer = peer;
+    peer.addEventListener("icecandidate", (event) => {
+      if (this.peer === peer && event.candidate) this.sendSignal("ice-candidate", event.candidate.toJSON());
     });
-    this.peer.addEventListener("connectionstatechange", () => {
-      const state = this.peer?.connectionState;
-      if (state === "failed" || state === "closed") this.fail("P2P 连接已断开");
-      if (state === "disconnected") this.setConnection("连接暂时中断", "正在等待网络恢复", "error");
+    peer.addEventListener("connectionstatechange", () => {
+      if (this.peer !== peer) return;
+      const state = peer.connectionState;
+      if (state === "failed") this.beginRecovery("P2P 连接已断开");
+      if (state === "disconnected") this.beginRecovery("连接暂时中断");
       if (state === "connected") void this.verifyDirectConnection();
     });
-    this.peer.addEventListener("datachannel", (event) => this.attachChannel(event.channel));
+    peer.addEventListener("datachannel", (event) => this.attachChannel(event.channel));
 
     if (this.role === "host") {
-      this.attachChannel(this.peer.createDataChannel("control", { ordered: true }));
-      this.attachChannel(this.peer.createDataChannel("file-data", { ordered: true }));
+      this.attachChannel(peer.createDataChannel("control", { ordered: true }));
+      this.attachChannel(peer.createDataChannel("file-data", { ordered: true }));
+    }
+  }
+
+  private disposePeer(): void {
+    const peer = this.peer;
+    this.peer = null;
+    this.control = null;
+    this.data = null;
+    this.pendingCandidates = [];
+    this.negotiationStarted = false;
+    this.verificationRunning = false;
+    peer?.close();
+  }
+
+  private beginRecovery(reason: string, reconnectSignaling = true): void {
+    this.reconnecting = true;
+    this.verified = false;
+    this.sendAttempt += 1;
+    this.fileInput.disabled = true;
+    this.dropZone.classList.add("disabled");
+    if (this.activeOutgoingTask) this.setActiveOutgoingStatus("paused");
+    if (this.receiver) this.setIncomingStatus(this.receiver.meta.fileId, "paused");
+    if (this.activeOutgoingTask || this.receiver) {
+      this.transferCard.classList.remove("hidden");
+      this.transferState.textContent = "已暂停，等待自动续传";
+      this.etaText.textContent = "等待网络恢复";
+    }
+    this.setConnection("连接暂时中断", `${reason}，正在自动重连`, "error");
+    this.disposePeer();
+    if (reconnectSignaling) {
+      const socket = this.socket;
+      this.socket = null;
+      socket?.close();
+      this.scheduleSignalingReconnect();
     }
   }
 
@@ -408,7 +482,7 @@ class LanDropApp {
     }
     channel.addEventListener("open", () => void this.verifyDirectConnection());
     channel.addEventListener("close", () => {
-      if (this.verified) this.fail("文件通道已关闭");
+      if ((this.control === channel || this.data === channel) && this.verified) this.beginRecovery("文件通道已关闭");
     });
   }
 
@@ -423,6 +497,8 @@ class LanDropApp {
       if (signal.type === "peer-joined") {
         this.peerName.textContent = typeof signal.deviceName === "string" ? signal.deviceName : "对方设备";
         this.setConnection("正在建立 P2P", this.peerName.textContent, "waiting");
+        this.disposePeer();
+        this.createPeer();
         if (this.role === "host" && !this.negotiationStarted) {
           this.negotiationStarted = true;
           const offer = await this.peer?.createOffer();
@@ -433,7 +509,7 @@ class LanDropApp {
         return;
       }
       if (signal.type === "peer-left") {
-        if (!this.verified) this.setConnection("对方已离开", "等待重新连接", "error");
+        this.beginRecovery("对方设备暂时离线", false);
         return;
       }
       if (signal.type === "signal-error") {
@@ -516,8 +592,32 @@ class LanDropApp {
 
   private enableFileSelection(): void {
     this.verified = true;
+    const wasReconnecting = this.reconnecting;
+    this.reconnecting = false;
     this.fileInput.disabled = false;
     this.dropZone.classList.remove("disabled");
+    if (wasReconnecting) this.resumeInterruptedTransfer();
+  }
+
+  private resumeInterruptedTransfer(): void {
+    if (this.activeOutgoingTask && this.selectedFile && this.outgoingFileId && this.peer) {
+      const chunkSize = chooseChunkPayloadSize(this.peer.sctp?.maxMessageSize);
+      this.setActiveOutgoingStatus("awaiting");
+      this.transferCard.classList.remove("hidden");
+      this.transferState.textContent = "正在协商续传";
+      this.sendControl({
+        type: "file-meta",
+        fileId: this.outgoingFileId,
+        name: this.selectedFile.name,
+        size: this.selectedFile.size,
+        mimeType: this.selectedFile.type || "application/octet-stream",
+        lastModified: this.selectedFile.lastModified,
+        chunkSize,
+        protocolVersion: PROTOCOL_VERSION,
+      });
+      return;
+    }
+    this.startNextOutgoing();
   }
 
   private setConnection(title: string, subtitle: string, state: "online" | "waiting" | "error"): void {
@@ -590,7 +690,8 @@ class LanDropApp {
           if (control.fileId === this.outgoingFileId) {
             this.senderAckedOffset = control.committedOffset;
             this.setActiveOutgoingStatus("sending");
-            void this.sendFile(control.committedOffset);
+            const attempt = ++this.sendAttempt;
+            void this.sendFile(control.committedOffset, attempt);
           }
           break;
         case "chunk-ack":
@@ -624,6 +725,33 @@ class LanDropApp {
   }
 
   private async prepareIncoming(meta: FileMeta): Promise<void> {
+    const verifiedHash = this.verifiedIncoming.get(meta.fileId);
+    if (verifiedHash) {
+      this.sendControl({ type: "file-verified", fileId: meta.fileId, ok: true, hash: verifiedHash });
+      return;
+    }
+    if (this.receiver?.meta.fileId === meta.fileId) {
+      const receiver = this.receiver;
+      await this.receiveChain;
+      if (this.receiver !== receiver) return;
+      if (receiver.meta.name !== meta.name || receiver.meta.size !== meta.size) {
+        throw new Error("续传文件信息与原任务不一致");
+      }
+      if (!receiver.accepted) {
+        this.setIncomingStatus(meta.fileId, "awaiting");
+        this.incomingCard.classList.remove("hidden");
+        return;
+      }
+      this.transferCard.classList.remove("hidden");
+      this.transferState.textContent = "正在续传";
+      this.setIncomingStatus(meta.fileId, "receiving");
+      this.sendControl({
+        type: "file-accept",
+        fileId: meta.fileId,
+        committedOffset: receiver.committedOffset,
+      });
+      return;
+    }
     const incomingTask: IncomingTask = {
       fileId: meta.fileId,
       name: meta.name,
@@ -652,6 +780,7 @@ class LanDropApp {
       storageMode: "memory",
       opfsKey: null,
       opfsHandle: null,
+      accepted: false,
     };
     this.receiver = receiver;
     this.incomingName.textContent = meta.name;
@@ -797,6 +926,7 @@ class LanDropApp {
 
   private beginReceiving(receiver: PendingReceive): void {
     this.sessionError.textContent = "";
+    receiver.accepted = true;
     this.incomingCard.classList.add("hidden");
     const displayName = receiver.savedName && receiver.savedName !== receiver.meta.name
       ? `${receiver.meta.name} → ${receiver.savedName}`
@@ -837,9 +967,9 @@ class LanDropApp {
     }
   }
 
-  private async waitForSendCapacity(nextOffset: number, fileId: string): Promise<void> {
+  private async waitForSendCapacity(nextOffset: number, fileId: string, attempt: number): Promise<void> {
     while (true) {
-      if (this.outgoingFileId !== fileId) throw new Error("文件任务已取消");
+      if (this.outgoingFileId !== fileId || this.sendAttempt !== attempt) throw new Error("文件任务已暂停");
       if (this.data?.readyState !== "open") throw new Error("文件通道已断开");
       const networkReady = this.data.bufferedAmount < BUFFERED_AMOUNT_LIMIT;
       const diskReady = nextOffset - this.senderAckedOffset < MAX_UNACKNOWLEDGED_BYTES;
@@ -848,7 +978,7 @@ class LanDropApp {
     }
   }
 
-  private async sendFile(startOffset: number): Promise<void> {
+  private async sendFile(startOffset: number, attempt: number): Promise<void> {
     const file = this.selectedFile;
     const fileId = this.outgoingFileId;
     if (!file || !fileId || !this.peer || !this.data) return;
@@ -868,7 +998,7 @@ class LanDropApp {
 
       this.transferState.textContent = "正在发送";
       while (offset < file.size) {
-        await this.waitForSendCapacity(offset, fileId);
+        await this.waitForSendCapacity(offset, fileId, attempt);
         const end = Math.min(offset + chunkSize, file.size);
         const payload = await file.slice(offset, end).arrayBuffer();
         hasher.update(new Uint8Array(payload));
@@ -878,18 +1008,18 @@ class LanDropApp {
       }
 
       while (this.senderAckedOffset < file.size) {
-        if (this.outgoingFileId !== fileId) throw new Error("文件任务已取消");
+        if (this.outgoingFileId !== fileId || this.sendAttempt !== attempt) throw new Error("文件任务已暂停");
         if (this.data.readyState !== "open") throw new Error("文件通道已断开");
         await delay(12);
       }
-      if (this.outgoingFileId !== fileId) throw new Error("文件任务已取消");
+      if (this.outgoingFileId !== fileId || this.sendAttempt !== attempt) throw new Error("文件任务已暂停");
       const hash = hasher.digest("hex");
       this.hashState.textContent = `SHA-256：发送端 ${hash}`;
       this.transferState.textContent = "等待接收端校验";
       this.setActiveOutgoingStatus("verifying");
       this.sendControl({ type: "file-complete", fileId, hash });
     } catch (error) {
-      if (this.outgoingFileId !== fileId) return;
+      if (this.outgoingFileId !== fileId || this.sendAttempt !== attempt || this.reconnecting) return;
       const text = error instanceof Error ? error.message : "文件发送失败";
       this.fail(text);
       this.trySendControl({ type: "file-error", fileId, error: text });
@@ -937,7 +1067,8 @@ class LanDropApp {
       this.hashState.textContent = ok ? `SHA-256：校验通过 · ${localHash}` : `SHA-256：校验失败 · ${localHash}`;
       this.transferState.textContent = ok ? "接收完成" : "校验失败";
       this.setIncomingStatus(fileId, ok ? "complete" : "failed", ok ? undefined : "SHA-256 校验失败");
-      this.sendControl({ type: "file-verified", fileId, ok, hash: localHash });
+      if (ok) this.verifiedIncoming.set(fileId, localHash);
+      this.trySendControl({ type: "file-verified", fileId, ok, hash: localHash });
       if (ok) this.transferCard.classList.add("hidden");
       this.receiver = null;
     } catch (error) {
@@ -1122,6 +1253,7 @@ class LanDropApp {
     const statusLabels: Record<IncomingStatus, string> = {
       awaiting: "等待确认",
       receiving: "接收中",
+      paused: "等待续传",
       verifying: "校验中",
       complete: "完成",
       rejected: "已拒绝",
@@ -1177,6 +1309,7 @@ class LanDropApp {
       waiting: "等待",
       awaiting: "等待接受",
       sending: "发送中",
+      paused: "等待续传",
       verifying: "校验中",
       complete: "完成",
       failed: "失败",
