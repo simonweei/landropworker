@@ -57,11 +57,6 @@
           <span>建立 P2P 直连后，将按队列逐个发送</span>
         </label>
 
-        <section id="queueCard" class="queue-card hidden" aria-live="polite">
-          <div class="queue-heading"><strong>发送队列</strong><span id="queueSummary"></span></div>
-          <ol id="queueList" class="queue-list"></ol>
-        </section>
-
         <article id="incomingCard" class="incoming hidden">
           <span class="eyebrow">收到文件请求</span>
           <h2 id="incomingName"></h2>
@@ -84,6 +79,16 @@
         </article>
 
         <p id="sessionError" class="error" role="alert"></p>
+
+        <section id="queueCard" class="queue-card hidden" aria-live="polite">
+          <div class="queue-heading"><strong>发送队列</strong><span id="queueSummary"></span></div>
+          <ol id="queueList" class="queue-list"></ol>
+        </section>
+
+        <section id="incomingQueueCard" class="queue-card hidden" aria-live="polite">
+          <div class="queue-heading"><strong>接收队列</strong><span id="incomingQueueSummary"></span></div>
+          <ol id="incomingQueueList" class="queue-list"></ol>
+        </section>
       </section>
 
       <footer><span>端到端加密</span><span>无云端存储</span><span>禁止 TURN 中继</span></footer>

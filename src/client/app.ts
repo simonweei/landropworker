@@ -67,6 +67,16 @@ type OutgoingTask = {
   error?: string;
 };
 
+type IncomingStatus = "awaiting" | "receiving" | "verifying" | "complete" | "rejected" | "failed";
+
+type IncomingTask = {
+  fileId: string;
+  name: string;
+  size: number;
+  status: IncomingStatus;
+  error?: string;
+};
+
 type FileTargetHandle = {
   createWritable(options?: {
     keepExistingData?: boolean;
@@ -166,6 +176,7 @@ class LanDropApp {
   private outgoingFileId: string | null = null;
   private outgoingTasks: OutgoingTask[] = [];
   private activeOutgoingTask: OutgoingTask | null = null;
+  private incomingTasks: IncomingTask[] = [];
   private senderAckedOffset = 0;
   private receiver: PendingReceive | null = null;
   private receiveDirectory: DirectoryTargetHandle | null = null;
@@ -196,6 +207,9 @@ class LanDropApp {
   private readonly queueCard = element<HTMLElement>("queueCard");
   private readonly queueSummary = element<HTMLElement>("queueSummary");
   private readonly queueList = element<HTMLOListElement>("queueList");
+  private readonly incomingQueueCard = element<HTMLElement>("incomingQueueCard");
+  private readonly incomingQueueSummary = element<HTMLElement>("incomingQueueSummary");
+  private readonly incomingQueueList = element<HTMLOListElement>("incomingQueueList");
   private readonly transferCard = element<HTMLElement>("transferCard");
   private readonly transferName = element<HTMLElement>("transferName");
   private readonly transferState = element<HTMLElement>("transferState");
@@ -553,7 +567,16 @@ class LanDropApp {
   }
 
   private async prepareIncoming(meta: FileMeta): Promise<void> {
+    const incomingTask: IncomingTask = {
+      fileId: meta.fileId,
+      name: meta.name,
+      size: meta.size,
+      status: "awaiting",
+    };
+    this.incomingTasks.push(incomingTask);
+    this.renderIncomingQueue();
     if (this.receiver || this.selectedFile) {
+      this.setIncomingStatus(meta.fileId, "rejected", "当前设备正在处理其他文件");
       this.sendControl({ type: "file-reject", fileId: meta.fileId, reason: "当前设备正在处理其他文件" });
       return;
     }
@@ -689,11 +712,13 @@ class LanDropApp {
       ? `${receiver.meta.name} → ${receiver.savedName}`
       : receiver.meta.name;
     this.showTransfer(displayName, receiver.meta.size, "正在接收");
+    this.setIncomingStatus(receiver.meta.fileId, "receiving");
     this.sendControl({ type: "file-accept", fileId: receiver.meta.fileId, committedOffset: 0 });
   }
 
   private rejectIncoming(): void {
     if (!this.receiver) return;
+    this.setIncomingStatus(this.receiver.meta.fileId, "rejected", "接收方已拒绝");
     this.sendControl({ type: "file-reject", fileId: this.receiver.meta.fileId, reason: "接收方已拒绝" });
     this.receiver = null;
     this.incomingCard.classList.add("hidden");
@@ -783,8 +808,12 @@ class LanDropApp {
   private async finishIncoming(fileId: string, senderHash: string): Promise<void> {
     const receiver = this.receiver;
     if (!receiver || receiver.meta.fileId !== fileId) throw new Error("完成消息对应未知文件");
-    if (receiver.committedOffset !== receiver.meta.size) throw new Error("文件尚未完整写入");
+    if (receiver.committedOffset !== receiver.meta.size) {
+      this.setIncomingStatus(fileId, "failed", "文件尚未完整写入");
+      throw new Error("文件尚未完整写入");
+    }
     try {
+      this.setIncomingStatus(fileId, "verifying");
       receiver.senderHash = senderHash;
       const localHash = receiver.hasher.digest("hex");
       const ok = localHash === senderHash;
@@ -799,6 +828,7 @@ class LanDropApp {
       }
       this.hashState.textContent = ok ? `SHA-256：校验通过 · ${localHash}` : `SHA-256：校验失败 · ${localHash}`;
       this.transferState.textContent = ok ? "接收完成" : "校验失败";
+      this.setIncomingStatus(fileId, ok ? "complete" : "failed", ok ? undefined : "SHA-256 校验失败");
       this.sendControl({ type: "file-verified", fileId, ok, hash: localHash });
       this.receiver = null;
     } catch (error) {
@@ -807,6 +837,7 @@ class LanDropApp {
       this.receiver = null;
       this.transferState.textContent = "保存失败";
       this.hashState.textContent = "SHA-256：文件未能提交到磁盘";
+      this.setIncomingStatus(fileId, "failed", text);
       this.trySendControl({ type: "file-error", fileId, error: text });
       throw new Error(text);
     }
@@ -833,6 +864,7 @@ class LanDropApp {
     const receiver = this.receiver;
     const text = describeFileSystemError(error, receiver?.meta.size ?? 0);
     if (receiver) {
+      this.setIncomingStatus(receiver.meta.fileId, "failed", text);
       this.ignoredIncomingFileIds.add(receiver.meta.fileId);
       await this.abortReceiver(receiver, text);
       this.trySendControl({ type: "file-error", fileId: receiver.meta.fileId, error: text });
@@ -851,6 +883,7 @@ class LanDropApp {
       this.finishActiveOutgoing("failed", reason, true);
     }
     if (this.receiver?.meta.fileId === fileId) {
+      this.setIncomingStatus(fileId, "failed", reason);
       this.ignoredIncomingFileIds.add(fileId);
       await this.abortReceiver(this.receiver, reason);
       this.receiver = null;
@@ -899,6 +932,48 @@ class LanDropApp {
   private async startNextOutgoingAfterDrain(): Promise<void> {
     while (this.data?.readyState === "open" && this.data.bufferedAmount > 0) await delay(20);
     this.startNextOutgoing();
+  }
+
+  private setIncomingStatus(fileId: string, status: IncomingStatus, error?: string): void {
+    const task = this.incomingTasks.find((item) => item.fileId === fileId);
+    if (!task) return;
+    task.status = status;
+    task.error = error;
+    this.renderIncomingQueue();
+  }
+
+  private renderIncomingQueue(): void {
+    const statusLabels: Record<IncomingStatus, string> = {
+      awaiting: "等待确认",
+      receiving: "接收中",
+      verifying: "校验中",
+      complete: "完成",
+      rejected: "已拒绝",
+      failed: "失败",
+    };
+    this.incomingQueueCard.classList.toggle("hidden", this.incomingTasks.length === 0);
+    const completed = this.incomingTasks.filter((task) => task.status === "complete").length;
+    const failed = this.incomingTasks.filter((task) => task.status === "failed").length;
+    const rejected = this.incomingTasks.filter((task) => task.status === "rejected").length;
+    this.incomingQueueSummary.textContent = `共 ${this.incomingTasks.length} 个 · 完成 ${completed}${failed ? ` · 失败 ${failed}` : ""}${rejected ? ` · 拒绝 ${rejected}` : ""}`;
+    this.incomingQueueList.replaceChildren(...this.incomingTasks.map((task) => {
+      const item = document.createElement("li");
+      item.className = `queue-item queue-${task.status}`;
+      const details = document.createElement("div");
+      const name = document.createElement("strong");
+      name.textContent = task.name;
+      const size = document.createElement("span");
+      size.textContent = formatBytes(task.size);
+      details.appendChild(name);
+      details.appendChild(size);
+      const status = document.createElement("span");
+      status.className = "queue-status";
+      status.textContent = statusLabels[task.status];
+      if (task.error) status.title = task.error;
+      item.appendChild(details);
+      item.appendChild(status);
+      return item;
+    }));
   }
 
   private renderQueue(): void {

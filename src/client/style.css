@@ -65,9 +65,9 @@ input:focus { border-color: #3bd8ae; box-shadow: 0 0 0 3px rgba(59,216,174,.12);
 .queue-item strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 .queue-item > div > span { color: #718699; font-size: 11px; margin-top: 3px; }
 .queue-status { flex: 0 0 auto; color: #9babbc; font-size: 12px; }
-.queue-awaiting, .queue-sending, .queue-verifying { border-color: #285544; }
-.queue-awaiting .queue-status, .queue-sending .queue-status, .queue-verifying .queue-status, .queue-complete .queue-status { color: #64e9c4; }
-.queue-failed .queue-status { color: #ff928f; }
+.queue-awaiting, .queue-sending, .queue-receiving, .queue-verifying { border-color: #285544; }
+.queue-awaiting .queue-status, .queue-sending .queue-status, .queue-receiving .queue-status, .queue-verifying .queue-status, .queue-complete .queue-status { color: #64e9c4; }
+.queue-failed .queue-status, .queue-rejected .queue-status { color: #ff928f; }
 .incoming, .transfer { margin-top: 24px; padding: 24px; border: 1px solid #254355; border-radius: 18px; background: #081522; }
 .incoming h2 { margin: 13px 0 5px; overflow-wrap: anywhere; }
 .actions { display: flex; gap: 10px; margin-top: 20px; }
