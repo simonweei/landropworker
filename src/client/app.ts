@@ -55,6 +55,7 @@ type PendingReceive = {
   lastAckOffset: number;
   senderHash: string | null;
   savedName: string | null;
+  requiresSavePicker: boolean;
 };
 
 type OutgoingStatus = "waiting" | "awaiting" | "sending" | "verifying" | "complete" | "failed";
@@ -558,7 +559,17 @@ class LanDropApp {
     }
     const hasher = await createSHA256();
     hasher.init();
-    const receiver: PendingReceive = { meta, writer: null, chunks: [], hasher, committedOffset: 0, lastAckOffset: 0, senderHash: null, savedName: null };
+    const receiver: PendingReceive = {
+      meta,
+      writer: null,
+      chunks: [],
+      hasher,
+      committedOffset: 0,
+      lastAckOffset: 0,
+      senderHash: null,
+      savedName: null,
+      requiresSavePicker: false,
+    };
     this.receiver = receiver;
     this.incomingName.textContent = meta.name;
     this.incomingSize.textContent = `${formatBytes(meta.size)} · ${meta.mimeType}`;
@@ -571,12 +582,13 @@ class LanDropApp {
       this.beginReceiving(receiver);
     } catch (error) {
       if (isNameNotAllowedError(error)) {
-        // Chromium requires a fresh user gesture before creating some
-        // security-sensitive file types through a reused directory handle.
-        // Keep the granted directory and let the user retry from the button.
+        // Chromium blocks security-sensitive extensions when they are created
+        // through a directory handle. The save picker can display Chrome's
+        // dangerous-file confirmation, so route only this file through it.
+        receiver.requiresSavePicker = true;
         this.incomingCard.classList.remove("hidden");
-        this.acceptButton.textContent = "确认接收";
-        this.sessionError.textContent = "浏览器要求再次确认创建此类型文件，请点击“确认接收”。";
+        this.acceptButton.textContent = "选择保存位置并接受";
+        this.sessionError.textContent = "浏览器不允许自动创建此类型文件，请为它单独选择保存位置。";
         return;
       }
       this.receiveDirectory = null;
@@ -592,7 +604,7 @@ class LanDropApp {
     if (!receiver) return;
     try {
       const directoryPicker = (window as SavePickerWindow).showDirectoryPicker;
-      if (directoryPicker && !this.receiveDirectory) {
+      if (!receiver.requiresSavePicker && directoryPicker && !this.receiveDirectory) {
         this.receiveDirectory = await directoryPicker({ mode: "readwrite" });
         this.receiveFolderName.textContent = this.receiveDirectory.name;
         this.receiveFolderCard.classList.remove("hidden");
@@ -602,22 +614,31 @@ class LanDropApp {
       this.beginReceiving(receiver);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
+      if (isNameNotAllowedError(error)) {
+        receiver.requiresSavePicker = true;
+        this.incomingCard.classList.remove("hidden");
+        this.acceptButton.textContent = "选择保存位置并接受";
+        this.sessionError.textContent = "浏览器不允许通过接收文件夹创建此类型文件，请为它单独选择保存位置。";
+        return;
+      }
       if (error instanceof DOMException && (error.name === "NotAllowedError" || error.name === "SecurityError")) {
         this.receiveDirectory = null;
         this.receiveFolderCard.classList.add("hidden");
         this.acceptButton.textContent = "选择接收文件夹并接受";
-      } else if (isNameNotAllowedError(error) && this.receiveDirectory) {
-        this.sessionError.textContent = "浏览器仍拒绝创建该文件。请重新选择一个普通接收文件夹后再试。";
-        this.receiveDirectory = null;
-        this.receiveFolderCard.classList.add("hidden");
-        this.acceptButton.textContent = "重新选择文件夹并接受";
-        return;
       }
       this.sessionError.textContent = describeFileSystemError(error, receiver.meta.size);
     }
   }
 
   private async prepareReceiverTarget(receiver: PendingReceive): Promise<void> {
+    if (receiver.requiresSavePicker) {
+      const picker = (window as SavePickerWindow).showSaveFilePicker;
+      if (!picker) throw new Error("当前浏览器不支持为受限类型单独选择保存位置");
+      const handle = await picker({ suggestedName: suggestedReceivedName(receiver.meta.name) });
+      receiver.savedName = receiver.meta.name;
+      receiver.writer = await this.createWritable(handle);
+      return;
+    }
     if (this.receiveDirectory) {
       receiver.savedName = await this.findAvailableReceivedName(this.receiveDirectory, receiver.meta.name);
       const handle = await this.receiveDirectory.getFileHandle(receiver.savedName, { create: true });
