@@ -88,6 +88,14 @@ export function suggestedReceivedName(name: string): string {
   return name;
 }
 
+export function receivedNameCandidate(name: string, duplicateIndex = 0): string {
+  const safeName = name.replace(/[\\/\0]/g, "_") || "未命名文件";
+  if (duplicateIndex <= 0) return safeName;
+  const extensionAt = safeName.lastIndexOf(".");
+  if (extensionAt <= 0 || extensionAt === safeName.length - 1) return `${safeName} (${duplicateIndex})`;
+  return `${safeName.slice(0, extensionAt)} (${duplicateIndex})${safeName.slice(extensionAt)}`;
+}
+
 export function describeFileSystemError(error: unknown, fileSize: number): string {
   if (error instanceof DOMException && error.name === "InvalidStateError") {
     return `保存文件失败：目标文件在传输期间发生变化，或磁盘空间不足。请不要覆盖已有文件，换一个新文件名，并确保至少有 ${formatBytes(fileSize)} 可用空间后重试。`;

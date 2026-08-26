@@ -12,6 +12,7 @@ import {
   describeFileSystemError,
   formatBytes,
   formatEta,
+  receivedNameCandidate,
   suggestedReceivedName,
 } from "./protocol";
 
@@ -52,6 +53,7 @@ type PendingReceive = {
   committedOffset: number;
   lastAckOffset: number;
   senderHash: string | null;
+  savedName: string | null;
 };
 
 type OutgoingStatus = "waiting" | "awaiting" | "sending" | "verifying" | "complete" | "failed";
@@ -63,13 +65,21 @@ type OutgoingTask = {
   error?: string;
 };
 
+type FileTargetHandle = {
+  createWritable(options?: {
+    keepExistingData?: boolean;
+    mode?: "exclusive" | "siloed";
+  }): Promise<WritableTarget>;
+};
+
+type DirectoryTargetHandle = {
+  readonly name: string;
+  getFileHandle(name: string, options?: { create?: boolean }): Promise<FileTargetHandle>;
+};
+
 type SavePickerWindow = Window & {
-  showSaveFilePicker?: (options?: { suggestedName?: string }) => Promise<{
-    createWritable(options?: {
-      keepExistingData?: boolean;
-      mode?: "exclusive" | "siloed";
-    }): Promise<WritableTarget>;
-  }>;
+  showSaveFilePicker?: (options?: { suggestedName?: string }) => Promise<FileTargetHandle>;
+  showDirectoryPicker?: (options?: { mode?: "read" | "readwrite" }) => Promise<DirectoryTargetHandle>;
 };
 
 const element = <T extends HTMLElement>(id: string): T => {
@@ -156,6 +166,7 @@ class LanDropApp {
   private activeOutgoingTask: OutgoingTask | null = null;
   private senderAckedOffset = 0;
   private receiver: PendingReceive | null = null;
+  private receiveDirectory: DirectoryTargetHandle | null = null;
   private readonly ignoredIncomingFileIds = new Set<string>();
   private receiveChain: Promise<void> = Promise.resolve();
   private speedSample = { bytes: 0, time: performance.now(), smoothed: 0 };
@@ -177,6 +188,9 @@ class LanDropApp {
   private readonly incomingCard = element<HTMLElement>("incomingCard");
   private readonly incomingName = element<HTMLElement>("incomingName");
   private readonly incomingSize = element<HTMLElement>("incomingSize");
+  private readonly acceptButton = element<HTMLButtonElement>("acceptButton");
+  private readonly receiveFolderCard = element<HTMLElement>("receiveFolderCard");
+  private readonly receiveFolderName = element<HTMLElement>("receiveFolderName");
   private readonly queueCard = element<HTMLElement>("queueCard");
   private readonly queueSummary = element<HTMLElement>("queueSummary");
   private readonly queueList = element<HTMLOListElement>("queueList");
@@ -210,12 +224,17 @@ class LanDropApp {
       this.dropZone.classList.remove("dragging");
       this.enqueueFiles(Array.from(event.dataTransfer?.files ?? []));
     });
-    element<HTMLButtonElement>("acceptButton").addEventListener("click", () => void this.acceptIncoming());
+    this.acceptButton.addEventListener("click", () => void this.acceptIncoming());
     element<HTMLButtonElement>("rejectButton").addEventListener("click", () => this.rejectIncoming());
 
-    if (!("showSaveFilePicker" in window)) {
+    if (!("showDirectoryPicker" in window) && "showSaveFilePicker" in window) {
+      this.capabilityWarning.textContent = "当前浏览器不支持一次授权接收文件夹，批量接收时仍需逐个选择保存位置。建议使用最新版桌面 Chrome 或 Edge。";
+      this.capabilityWarning.classList.remove("hidden");
+      this.acceptButton.textContent = "选择保存位置并接受";
+    } else if (!("showDirectoryPicker" in window) && !("showSaveFilePicker" in window)) {
       this.capabilityWarning.textContent = `当前浏览器不支持流式磁盘写入，仅允许接收 ${formatBytes(FALLBACK_MEMORY_LIMIT)} 以内的文件。超大文件请使用桌面版 Chrome 或 Edge。`;
       this.capabilityWarning.classList.remove("hidden");
+      this.acceptButton.textContent = "接受并下载";
     }
   }
 
@@ -538,42 +557,99 @@ class LanDropApp {
     }
     const hasher = await createSHA256();
     hasher.init();
-    this.receiver = { meta, writer: null, chunks: [], hasher, committedOffset: 0, lastAckOffset: 0, senderHash: null };
+    const receiver: PendingReceive = { meta, writer: null, chunks: [], hasher, committedOffset: 0, lastAckOffset: 0, senderHash: null, savedName: null };
+    this.receiver = receiver;
     this.incomingName.textContent = meta.name;
     this.incomingSize.textContent = `${formatBytes(meta.size)} · ${meta.mimeType}`;
-    this.incomingCard.classList.remove("hidden");
+    if (!this.receiveDirectory) {
+      this.incomingCard.classList.remove("hidden");
+      return;
+    }
+    try {
+      await this.prepareReceiverTarget(receiver);
+      this.beginReceiving(receiver);
+    } catch (error) {
+      this.receiveDirectory = null;
+      this.receiveFolderCard.classList.add("hidden");
+      this.incomingCard.classList.remove("hidden");
+      this.sessionError.textContent = `${describeFileSystemError(error, meta.size)} 请重新选择接收文件夹。`;
+    }
   }
 
   private async acceptIncoming(): Promise<void> {
     const receiver = this.receiver;
     if (!receiver) return;
     try {
-      const picker = (window as SavePickerWindow).showSaveFilePicker;
-      if (picker) {
-        const handle = await picker({ suggestedName: suggestedReceivedName(receiver.meta.name) });
-        try {
-          receiver.writer = await handle.createWritable({
-            keepExistingData: false,
-            mode: "exclusive",
-          });
-        } catch (error) {
-          // Older Chromium releases implemented createWritable() before the
-          // locking mode option. Keep compatibility while preferring a lock.
-          if (!(error instanceof TypeError)) throw error;
-          receiver.writer = await handle.createWritable({ keepExistingData: false });
-        }
-      } else if (receiver.meta.size > FALLBACK_MEMORY_LIMIT) {
-        throw new Error(`当前浏览器不能安全接收超过 ${formatBytes(FALLBACK_MEMORY_LIMIT)} 的文件`);
+      const directoryPicker = (window as SavePickerWindow).showDirectoryPicker;
+      if (directoryPicker && !this.receiveDirectory) {
+        this.receiveDirectory = await directoryPicker({ mode: "readwrite" });
+        this.receiveFolderName.textContent = this.receiveDirectory.name;
+        this.receiveFolderCard.classList.remove("hidden");
       }
-      this.incomingCard.classList.add("hidden");
-      this.showTransfer(receiver.meta.name, receiver.meta.size, "正在接收");
-      this.sendControl({ type: "file-accept", fileId: receiver.meta.fileId, committedOffset: 0 });
+      await this.prepareReceiverTarget(receiver);
+      this.beginReceiving(receiver);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") return;
-      this.sendControl({ type: "file-reject", fileId: receiver.meta.fileId, reason: error instanceof Error ? error.message : "无法创建目标文件" });
-      this.fail(error instanceof Error ? error.message : "无法创建目标文件");
-      this.receiver = null;
+      if (error instanceof DOMException && (error.name === "NotAllowedError" || error.name === "SecurityError")) {
+        this.receiveDirectory = null;
+        this.receiveFolderCard.classList.add("hidden");
+      }
+      this.sessionError.textContent = describeFileSystemError(error, receiver.meta.size);
     }
+  }
+
+  private async prepareReceiverTarget(receiver: PendingReceive): Promise<void> {
+    if (this.receiveDirectory) {
+      receiver.savedName = await this.findAvailableReceivedName(this.receiveDirectory, receiver.meta.name);
+      const handle = await this.receiveDirectory.getFileHandle(receiver.savedName, { create: true });
+      receiver.writer = await this.createWritable(handle);
+      return;
+    }
+    const picker = (window as SavePickerWindow).showSaveFilePicker;
+    if (picker) {
+      const handle = await picker({ suggestedName: suggestedReceivedName(receiver.meta.name) });
+      receiver.savedName = receiver.meta.name;
+      receiver.writer = await this.createWritable(handle);
+      return;
+    }
+    if (receiver.meta.size > FALLBACK_MEMORY_LIMIT) {
+      throw new Error(`当前浏览器不能安全接收超过 ${formatBytes(FALLBACK_MEMORY_LIMIT)} 的文件`);
+    }
+    receiver.savedName = receiver.meta.name;
+  }
+
+  private async createWritable(handle: FileTargetHandle): Promise<WritableTarget> {
+    try {
+      return await handle.createWritable({ keepExistingData: false, mode: "exclusive" });
+    } catch (error) {
+      // Older Chromium releases implemented createWritable() before locking mode.
+      if (!(error instanceof TypeError)) throw error;
+      return handle.createWritable({ keepExistingData: false });
+    }
+  }
+
+  private async findAvailableReceivedName(directory: DirectoryTargetHandle, originalName: string): Promise<string> {
+    for (let duplicateIndex = 0; duplicateIndex < 10_000; duplicateIndex += 1) {
+      const candidate = receivedNameCandidate(originalName, duplicateIndex);
+      try {
+        await directory.getFileHandle(candidate);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "NotFoundError") return candidate;
+        if (error instanceof DOMException && error.name === "TypeMismatchError") continue;
+        throw error;
+      }
+    }
+    throw new Error("接收文件夹中同名文件过多，请更换接收文件夹");
+  }
+
+  private beginReceiving(receiver: PendingReceive): void {
+    this.sessionError.textContent = "";
+    this.incomingCard.classList.add("hidden");
+    const displayName = receiver.savedName && receiver.savedName !== receiver.meta.name
+      ? `${receiver.meta.name} → ${receiver.savedName}`
+      : receiver.meta.name;
+    this.showTransfer(displayName, receiver.meta.size, "正在接收");
+    this.sendControl({ type: "file-accept", fileId: receiver.meta.fileId, committedOffset: 0 });
   }
 
   private rejectIncoming(): void {

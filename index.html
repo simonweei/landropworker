@@ -44,6 +44,12 @@
 
         <div id="capabilityWarning" class="notice hidden"></div>
 
+        <div id="receiveFolderCard" class="folder-notice hidden">
+          <span>接收文件夹</span>
+          <strong id="receiveFolderName"></strong>
+          <small>本次连接的后续文件将自动保存；同名文件会自动重命名</small>
+        </div>
+
         <label id="dropZone" class="drop-zone disabled">
           <input id="fileInput" type="file" multiple disabled />
           <span class="drop-icon">＋</span>
@@ -61,7 +67,7 @@
           <h2 id="incomingName"></h2>
           <p id="incomingSize" class="muted"></p>
           <div class="actions">
-            <button id="acceptButton" class="primary">选择保存位置并接受</button>
+            <button id="acceptButton" class="primary">选择接收文件夹并接受</button>
             <button id="rejectButton" class="ghost">拒绝</button>
           </div>
         </article>

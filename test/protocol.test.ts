@@ -7,6 +7,7 @@ import {
   describeFileSystemError,
   encodeChunk,
   formatBytes,
+  receivedNameCandidate,
   suggestedReceivedName,
 } from "../src/client/protocol";
 
@@ -43,6 +44,12 @@ describe("binary file protocol", () => {
   it("preserves the original filename", () => {
     expect(suggestedReceivedName("archive.iso")).toBe("archive.iso");
     expect(suggestedReceivedName("中文文件名.zip")).toBe("中文文件名.zip");
+  });
+
+  it("creates safe non-overwriting names in a shared receive folder", () => {
+    expect(receivedNameCandidate("archive.tar.gz", 1)).toBe("archive.tar (1).gz");
+    expect(receivedNameCandidate("README", 2)).toBe("README (2)");
+    expect(receivedNameCandidate("../unsafe.txt")).toBe(".._unsafe.txt");
   });
 
   it("turns Chromium file state failures into actionable guidance", () => {

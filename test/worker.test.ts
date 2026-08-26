@@ -18,6 +18,8 @@ describe("pairing API", () => {
     expect(response.status).toBe(200);
     expect(html).toContain('id="fileInput" type="file" multiple');
     expect(html).toContain('id="queueList"');
+    expect(html).toContain('id="receiveFolderCard"');
+    expect(html).toContain("本次连接的后续文件将自动保存");
   });
 
   it("creates a six-digit room and joins it once", async () => {
