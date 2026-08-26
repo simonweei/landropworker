@@ -45,10 +45,6 @@ input:focus { border-color: #3bd8ae; box-shadow: 0 0 0 3px rgba(59,216,174,.12);
 .status-dot.online { background: #36e7b5; box-shadow: 0 0 0 5px rgba(54,231,181,.1); }
 .status-dot.error { background: #ff6764; }
 .notice { margin-top: 22px; background: #182315; border: 1px solid #3c502a; color: #d5e6b0; border-radius: 14px; padding: 13px 16px; font-size: 13px; }
-.folder-notice { margin-top: 22px; display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 3px 12px; padding: 13px 16px; border: 1px solid #285544; border-radius: 14px; background: #0d211d; }
-.folder-notice span { color: #70e5c4; font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
-.folder-notice strong { overflow-wrap: anywhere; }
-.folder-notice small { grid-column: 2; color: #789b91; }
 .drop-zone { margin-top: 30px; min-height: 230px; border: 1px dashed #315063; border-radius: 20px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; transition: border .15s, background .15s; }
 .drop-zone:not(.disabled):hover, .drop-zone.dragging { border-color: #38dcb0; background: rgba(56,220,176,.04); }
 .drop-zone.disabled { opacity: .48; cursor: not-allowed; }
@@ -58,6 +54,11 @@ input:focus { border-color: #3bd8ae; box-shadow: 0 0 0 3px rgba(59,216,174,.12);
 .queue-card { margin-top: 24px; padding: 20px 22px; border: 1px solid #213c4d; border-radius: 18px; background: rgba(8, 21, 34, .78); }
 .queue-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .queue-heading span { color: #7890a4; font-size: 12px; }
+.queue-heading-title { display: flex; align-items: center; gap: 8px; }
+.folder-button { width: 30px; height: 30px; display: grid; place-items: center; padding: 0; border: 1px solid transparent; border-radius: 9px; background: transparent; color: #70e5c4; transition: border-color .15s, background .15s; }
+.folder-button:hover { border-color: #285544; background: rgba(56, 220, 176, .08); }
+.folder-button:focus-visible { outline: 2px solid #43e2b7; outline-offset: 2px; }
+.folder-button svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linejoin: round; }
 .queue-list { list-style: none; padding: 0; margin: 14px 0 0; display: grid; gap: 8px; }
 .queue-item { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 11px 12px; border-radius: 12px; background: #0b1a28; border: 1px solid transparent; }
 .queue-item > div { min-width: 0; }

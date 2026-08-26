@@ -110,7 +110,10 @@ type OpfsStorageManager = StorageManager & {
 
 type SavePickerWindow = Window & {
   showSaveFilePicker?: (options?: { suggestedName?: string }) => Promise<FileTargetHandle>;
-  showDirectoryPicker?: (options?: { mode?: "read" | "readwrite" }) => Promise<DirectoryTargetHandle>;
+  showDirectoryPicker?: (options?: {
+    mode?: "read" | "readwrite";
+    startIn?: DirectoryTargetHandle;
+  }) => Promise<DirectoryTargetHandle>;
 };
 
 const element = <T extends HTMLElement>(id: string): T => {
@@ -224,8 +227,7 @@ class LanDropApp {
   private readonly incomingName = element<HTMLElement>("incomingName");
   private readonly incomingSize = element<HTMLElement>("incomingSize");
   private readonly acceptButton = element<HTMLButtonElement>("acceptButton");
-  private readonly receiveFolderCard = element<HTMLElement>("receiveFolderCard");
-  private readonly receiveFolderName = element<HTMLElement>("receiveFolderName");
+  private readonly openReceiveFolderButton = element<HTMLButtonElement>("openReceiveFolder");
   private readonly mobileSaveCard = element<HTMLElement>("mobileSaveCard");
   private readonly mobileSaveList = element<HTMLUListElement>("mobileSaveList");
   private readonly queueCard = element<HTMLElement>("queueCard");
@@ -270,6 +272,7 @@ class LanDropApp {
       this.enqueueFiles(Array.from(event.dataTransfer?.files ?? []));
     });
     this.acceptButton.addEventListener("click", () => void this.acceptIncoming());
+    this.openReceiveFolderButton.addEventListener("click", () => void this.openReceiveFolder());
     element<HTMLButtonElement>("rejectButton").addEventListener("click", () => void this.rejectIncoming());
     window.addEventListener("beforeunload", (event) => {
       if (this.stagedReceives.length === 0) return;
@@ -607,6 +610,7 @@ class LanDropApp {
           if (control.fileId === this.outgoingFileId) {
             this.hashState.textContent = control.ok ? `SHA-256：校验通过 · ${control.hash}` : "SHA-256：接收端校验失败";
             this.transferState.textContent = control.ok ? "传输完成" : "校验失败";
+            if (control.ok) this.transferCard.classList.add("hidden");
             this.finishActiveOutgoing(control.ok ? "complete" : "failed", control.ok ? undefined : "SHA-256 校验失败", false);
           }
           break;
@@ -673,7 +677,7 @@ class LanDropApp {
       }
       if (this.receiveDirectory) {
         this.receiveDirectory = null;
-        this.receiveFolderCard.classList.add("hidden");
+        this.renderReceiveFolderButton();
         this.acceptButton.textContent = "选择接收文件夹并接受";
       }
       this.incomingCard.classList.remove("hidden");
@@ -689,8 +693,7 @@ class LanDropApp {
       const directoryPicker = (window as SavePickerWindow).showDirectoryPicker;
       if (!receiver.requiresSavePicker && directoryPicker && !this.receiveDirectory) {
         this.receiveDirectory = await directoryPicker({ mode: "readwrite" });
-        this.receiveFolderName.textContent = this.receiveDirectory.name;
-        this.receiveFolderCard.classList.remove("hidden");
+        this.renderReceiveFolderButton();
         this.acceptButton.textContent = "确认接收";
       }
       await this.prepareReceiverTarget(receiver);
@@ -707,7 +710,7 @@ class LanDropApp {
       }
       if (error instanceof DOMException && (error.name === "NotAllowedError" || error.name === "SecurityError")) {
         this.receiveDirectory = null;
-        this.receiveFolderCard.classList.add("hidden");
+        this.renderReceiveFolderButton();
         this.acceptButton.textContent = "选择接收文件夹并接受";
       }
       this.sessionError.textContent = describeFileSystemError(error, receiver.meta.size);
@@ -935,6 +938,7 @@ class LanDropApp {
       this.transferState.textContent = ok ? "接收完成" : "校验失败";
       this.setIncomingStatus(fileId, ok ? "complete" : "failed", ok ? undefined : "SHA-256 校验失败");
       this.sendControl({ type: "file-verified", fileId, ok, hash: localHash });
+      if (ok) this.transferCard.classList.add("hidden");
       this.receiver = null;
     } catch (error) {
       const text = describeFileSystemError(error, receiver.meta.size);
@@ -1146,6 +1150,26 @@ class LanDropApp {
       item.appendChild(status);
       return item;
     }));
+  }
+
+  private renderReceiveFolderButton(): void {
+    const directory = this.receiveDirectory;
+    this.openReceiveFolderButton.classList.toggle("hidden", !directory);
+    const label = directory ? `打开接收文件夹：${directory.name}` : "打开接收文件夹";
+    this.openReceiveFolderButton.title = label;
+    this.openReceiveFolderButton.setAttribute("aria-label", label);
+  }
+
+  private async openReceiveFolder(): Promise<void> {
+    const directory = this.receiveDirectory;
+    const picker = (window as SavePickerWindow).showDirectoryPicker;
+    if (!directory || !picker) return;
+    try {
+      await picker({ mode: "read", startIn: directory });
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") return;
+      this.sessionError.textContent = "无法打开接收文件夹";
+    }
   }
 
   private renderQueue(): void {

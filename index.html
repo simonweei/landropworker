@@ -44,12 +44,6 @@
 
         <div id="capabilityWarning" class="notice hidden"></div>
 
-        <div id="receiveFolderCard" class="folder-notice hidden">
-          <span>接收文件夹</span>
-          <strong id="receiveFolderName"></strong>
-          <small>本次连接的后续文件将自动保存；同名文件会自动重命名</small>
-        </div>
-
         <label id="dropZone" class="drop-zone disabled">
           <input id="fileInput" type="file" multiple disabled />
           <span class="drop-icon">＋</span>
@@ -91,7 +85,17 @@
         </section>
 
         <section id="incomingQueueCard" class="queue-card hidden" aria-live="polite">
-          <div class="queue-heading"><strong>接收队列</strong><span id="incomingQueueSummary"></span></div>
+          <div class="queue-heading">
+            <div class="queue-heading-title">
+              <strong>接收队列</strong>
+              <button id="openReceiveFolder" class="folder-button hidden" type="button" aria-label="打开接收文件夹" title="打开接收文件夹">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M3 6.75A1.75 1.75 0 0 1 4.75 5h4.19c.46 0 .9.18 1.24.51l1.3 1.24h7.77A1.75 1.75 0 0 1 21 8.5v8.75A1.75 1.75 0 0 1 19.25 19H4.75A1.75 1.75 0 0 1 3 17.25V6.75Z" />
+                </svg>
+              </button>
+            </div>
+            <span id="incomingQueueSummary"></span>
+          </div>
           <ol id="incomingQueueList" class="queue-list"></ol>
         </section>
       </section>
