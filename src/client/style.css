@@ -12,7 +12,8 @@ button, input { font: inherit; }
 button { cursor: pointer; }
 .shell { width: min(100% - 32px, 900px); margin: 0 auto; padding: 34px 0 28px; }
 .brand { display: flex; align-items: center; gap: 12px; margin-bottom: 28px; }
-.brand-mark { width: 42px; height: 42px; border: 1px solid #2fdfb6; color: #2fdfb6; display: grid; place-items: center; border-radius: 12px; font-size: 24px; }
+.brand-mark { width: 42px; height: 42px; border: 1px solid #2fdfb6; display: grid; place-items: center; border-radius: 12px; }
+.brand-mark img { width: 28px; height: 28px; display: block; }
 .brand strong, .brand span { display: block; }
 .brand strong { letter-spacing: .03em; }
 .brand span { color: #8494a7; font-size: 12px; margin-top: 2px; }
